@@ -187,6 +187,9 @@ Two ways to enable web search in the web UI:
 | [`04-host-apiproxy-termux-open-index.patch`](patches/04-host-apiproxy-termux-open-index.patch) | `dsh-host-apiproxy` | Opens paths/URLs via `termux-open` on Android; enables native-path detection |
 | [`04-host-apiproxy-termux-open-opener.patch`](patches/04-host-apiproxy-termux-open-opener.patch) | `dsh-host-apiproxy` | Same fixes in `lib/types/native-path-opener.js` |
 | [`05-host-directory-picker-native-android.patch`](patches/05-host-directory-picker-native-android.patch) | `dsh-host-directory-picker-native` | Routes directory picking through the Linux (zenity) path on Android |
+| [`06-workspace-archive-skip-session-known-check.patch`](patches/06-workspace-archive-skip-session-known-check.patch) | `dsh-workspace` | Skips the session-known integrity check when archiving (fails on fresh installs) |
+| [`07-sandbox-local-proot-runner.patch`](patches/07-sandbox-local-proot-runner.patch) | `dsh-sandbox-local` | Uses `proot` as the sandbox runner on Termux (no bubblewrap namespace support) |
+| [`08-dsh-tool-fs-search-android-rg.patch`](patches/08-dsh-tool-fs-search-android-rg.patch) | `dsh-tool-fs-search` | Resolves ripgrep via `require.resolve()` + system-rg fallback; `@vscode/ripgrep` ships no `android-arm64` platform package (see [`docs/termux-ripgrep-fix.md`](docs/termux-ripgrep-fix.md)) |
 | [`koffi-statx.patch`](patches/koffi-statx.patch) | `koffi` | Conditionally compiles out the `statx()` syscall on Android |
 
 ## Compatibility Notes
@@ -203,6 +206,10 @@ deepseek-harness-termux/
 ├── README.zh-CN.md            # 简体中文 README
 ├── LICENSE                    # MIT License
 ├── install.sh                 # Automated installer (idempotent)
+├── docs/
+│   └── termux-ripgrep-fix.md  # Ripgrep android-arm64 fix (root cause + recovery)
+├── scripts/
+│   └── fix-dsh-glob-rg.sh     # Re-apply the ripgrep fix after `npm update -g`
 └── patches/                   # Source patches (patch -p1 inside each package)
     ├── 01-terminal-bash-android-shell.patch
     ├── 02-session-persistence-link-rename.patch
@@ -210,6 +217,9 @@ deepseek-harness-termux/
     ├── 04-host-apiproxy-termux-open-index.patch
     ├── 04-host-apiproxy-termux-open-opener.patch
     ├── 05-host-directory-picker-native-android.patch
+    ├── 06-workspace-archive-skip-session-known-check.patch
+    ├── 07-sandbox-local-proot-runner.patch
+    ├── 08-dsh-tool-fs-search-android-rg.patch
     └── koffi-statx.patch
 ```
 

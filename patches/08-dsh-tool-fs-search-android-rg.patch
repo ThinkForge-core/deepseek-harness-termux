@@ -1,0 +1,36 @@
+--- a/lib/index.js	1985-10-26 16:15:00.000000000 +0800
++++ b/lib/index.js	2026-08-26 18:50:38.971188057 +0800
+@@ -1,5 +1,7 @@
+ import z from "@deepseek-ai/schemastery";
+ import { MAX_TIMER_DELAY_MS } from "@deepseek-ai/dsh-timeout";
++import { existsSync } from "node:fs";
++import { createRequire } from "node:module";
+ import { isAbsolute, relative, sep } from "node:path";
+ import { defineTool } from "@deepseek-ai/dsh-tools";
+ import { HarnessError } from "@deepseek-ai/dsh-llm";
+@@ -118,7 +120,24 @@
+ *   when the platform package cannot be resolved.
+ */
+ function resolveRgPath() {
+-	rgPathPromise ??= import("@vscode/ripgrep").then((module) => module.rgPath);
++	rgPathPromise ??= Promise.resolve().then(() => {
++		// Termux compatibility (android-arm64): `@vscode/ripgrep` ships no
++		// platform package; resolve via require.resolve (no module evaluation)
++		// with a system-rg fallback.
++		const require = createRequire(import.meta.url);
++		const binaryName = process.platform === "win32" ? "rg.exe" : "rg";
++		try {
++			return require.resolve(`@vscode/ripgrep-${process.platform}-${process.arch}/bin/${binaryName}`);
++		} catch {
++			const candidates = process.env.RIPGREP_BIN
++				? [process.env.RIPGREP_BIN]
++				: ["/data/data/com.termux/files/usr/bin/rg", "/usr/bin/rg", "/usr/local/bin/rg"];
++			for (const candidate of candidates) {
++				if (candidate && existsSync(candidate)) return candidate;
++			}
++			throw new Error(`Could not resolve packaged ripgrep for ${process.platform}-${process.arch} and no system rg was found`);
++		}
++	});
+ 	return rgPathPromise;
+ }
+ /**

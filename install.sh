@@ -396,6 +396,36 @@ apply_patch "$REPO_DIR/patches/04-host-apiproxy-termux-open-opener.patch"     "$
 apply_patch "$REPO_DIR/patches/05-host-directory-picker-native-android.patch" "$DSH_PKGS/dsh-host-directory-picker-native" || true
 apply_patch "$REPO_DIR/patches/06-workspace-archive-skip-session-known-check.patch" "$DSH_PKGS/dsh-workspace" || true
 apply_patch "$REPO_DIR/patches/07-sandbox-local-proot-runner.patch"           "$DSH_PKGS/dsh-sandbox-local" || true
+apply_patch "$REPO_DIR/patches/08-dsh-tool-fs-search-android-rg.patch"         "$DSH_PKGS/dsh-tool-fs-search" || true
+
+# ripgrep platform-package shim: @vscode/ripgrep resolves
+# @vscode/ripgrep-${platform}-${arch}, which for Termux is
+# @vscode/ripgrep-android-arm64 — a package that does not exist. Without it,
+# the glob/grep tools fail with "ripgrep launch failed" in every fresh
+# process. Create the shim (bin/rg -> system rg) so require.resolve() (the
+# patched resolveRgPath in 08-*.patch) finds a binary. Idempotent.
+RG_SHIM="$DSH_PKGS/../@vscode/ripgrep-android-arm64"
+RG_SYSTEM="${RG_SYSTEM:-/data/data/com.termux/files/usr/bin/rg}"
+if [ -x "$RG_SYSTEM" ]; then
+    if [ ! -f "$RG_SHIM/package.json" ]; then
+        mkdir -p "$RG_SHIM/bin"
+        cat > "$RG_SHIM/package.json" <<EOF
+{
+  "name": "@vscode/ripgrep-android-arm64",
+  "version": "1.18.0",
+  "description": "Termux shim: resolves rgPath to the system ripgrep ($RG_SYSTEM); @vscode/ripgrep has no android platform package.",
+  "license": "MIT",
+  "bin": { "rg": "bin/rg" }
+}
+EOF
+        ln -sf "$RG_SYSTEM" "$RG_SHIM/bin/rg"
+        echo "  [OK] ripgrep android shim -> $RG_SYSTEM"
+    else
+        echo "  [SKIP] ripgrep android shim already present"
+    fi
+else
+    echo "  [WARN] system rg not found at $RG_SYSTEM — glob/grep tools need it (pkg install ripgrep)"
+fi
 
 # ── Step 5: Build native addons (koffi first — its statx() patch must be     ─
 #            baked into the binary) ───────────────────────────────────────────
@@ -553,6 +583,7 @@ for patch_file in "$REPO_DIR"/patches/*.patch; do
         host-directory-picker-native-android)       dir="$DSH_PKGS/dsh-host-directory-picker-native" ;;
         workspace-archive-skip-session-known-check) dir="$DSH_PKGS/dsh-workspace" ;;
         sandbox-local-proot-runner)                 dir="$DSH_PKGS/dsh-sandbox-local" ;;
+        dsh-tool-fs-search-android-rg)              dir="$DSH_PKGS/dsh-tool-fs-search" ;;
         koffi-statx)                                dir="$DSH_DIR/node_modules/koffi" ;;
         *) dir="" ;;
     esac
