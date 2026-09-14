@@ -19,7 +19,7 @@
 #   MODES=full   bash scripts/build-prebuilt.sh    # only the vendored tarball
 #
 # The natives are N-API (ABI stable), so the tarballs keep working across dsh
-# updates; rebuild only when the patches or native deps change.
+# updates; rebuild only when the fix set or native deps change.
 
 set -euo pipefail
 
@@ -64,6 +64,7 @@ build_layered() {
     STAGE="$(mktemp -d)"
     mkdir -p "$STAGE/package/bin" \
              "$STAGE/package/patches" \
+             "$STAGE/package/scripts" \
              "$STAGE/package/prebuilt/android-arm64"
 
     cp "$PKG_DIR/package.json" "$STAGE/package/"
@@ -73,6 +74,8 @@ build_layered() {
     cp "$PKG_DIR/bin/dsh"       "$STAGE/package/bin/dsh"
     chmod +x "$STAGE/package/bin/dsh"
     cp "$REPO_DIR"/patches/*.patch "$STAGE/package/patches/"
+    cp "$REPO_DIR"/scripts/apply-termux-fixes.mjs "$STAGE/package/scripts/"
+    cp "$REPO_DIR"/TERMUX-PATCHES.md "$STAGE/package/"
     cp "$PTY"  "$STAGE/package/prebuilt/android-arm64/pty.node"
     cp "$KOFFI" "$STAGE/package/prebuilt/android-arm64/koffi.node"
 
@@ -121,6 +124,12 @@ build_full() {
                 npm install @img/sharp-wasm32 --no-save --ignore-scripts > /dev/null 2>&1 || true)
         fi
     fi
+
+    # ship the canonical patcher next to the vendored tree so `npm i -g` later
+    # can re-apply fixes with fix-dsh-runtime.sh semantics
+    mkdir -p "$FULL_PKG/scripts" "$FULL_PKG/patches"
+    cp "$REPO_DIR"/scripts/apply-termux-fixes.mjs "$FULL_PKG/scripts/"
+    cp "$REPO_DIR"/patches/*.patch "$FULL_PKG/patches/"
 
     # verify the vendored tree is self-sufficient
     if ! (cd "$FULL_PKG" && node -e "require('sharp'); require('node-pty'); require('koffi'); console.log('    vendored natives OK')"); then

@@ -1,683 +1,456 @@
 #!/usr/bin/env bash
-# install.sh — Fully automated install of @deepseek-ai/dsh on Android/Termux
-# Usage: bash install.sh
+# install.sh — fully automated install of @deepseek-ai/dsh on Android/Termux.
 #
-# This script installs dsh with ALL plugins enabled (HMR, subprocess, bash
-# sandbox, permission). It automatically detects and installs the Android NDK
-# (ndk-sysroot), C toolchain (clang, binutils), and all build-time dependencies.
+# Usage:
+#   bash install.sh [VERSION]     # VERSION default: latest
 #
-# Why a two-phase install:
-#   The old one-phase flow let npm run node-pty/koffi's install scripts DURING
-#   `npm install -g`, at which point the build environment (node headers,
-#   GYP_DEFINES, the common.gypi android_ndk_path default, the koffi statx()
-#   patch) was NOT yet configured — so fresh devices failed with
-#   "gyp: Undefined variable android_ndk_path" or "node.h: No such file or
-#   directory". Here we install with --ignore-scripts first, configure
-#   everything, apply source patches, and only then build the native addons
-#   manually with a fully prepared environment.
+# The script is designed to run against a CLEAN kernel: it installs dsh from
+# npm and then applies every Termux fix through scripts/apply-termux-fixes.mjs
+# (idempotent, anchor-based, fails loudly if upstream code moved). Re-running it
+# is always safe and repairs a tree that an `npm install -g` has overwritten.
+#
+# What it fixes and why:
+#   * pnpm pinned to @11 — v12+ ships a native @pnpm/exe binary with no
+#     android-arm64 build.
+#   * koffi.node output path is version-dependent: resolved recursively and
+#     copied to the canonical build/koffi/android_arm64/koffi.node.
+#   * sharp has no android-arm64 native build -> the official @img/sharp-wasm32
+#     runtime fallback is installed instead of a hand-made stub.
+#   * hardlink(2) is denied by Android sepolicy -> every link()-based atomic
+#     publish (write/edit tools, session files, attachments) falls back to
+#     rename(2). See patches section 2-4 of the patcher.
 
 set -euo pipefail
 
+readonly RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[1;33m' BLUE='\033[0;34m'
+readonly MAGENTA='\033[0;35m' CYAN='\033[0;36m' WHITE='\033[1;37m' BOLD='\033[1m'
+readonly DIM='\033[2m' RESET='\033[0m' BG_RED='\033[41m' BG_GREEN='\033[42m'
+
+print_header() {
+    echo -e "\n${BOLD}${BLUE}══════════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${BLUE}  $1${RESET}"
+    echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════════${RESET}"
+}
+print_step()  { echo -e "\n${BOLD}${CYAN}▶ [$1]${RESET} ${BOLD}$2${RESET}"; }
+print_ok()    { echo -e "  ${GREEN}✓${RESET} $1"; }
+print_error() { echo -e "  ${RED}✗${RESET} $1" >&2; }
+print_warn()  { echo -e "  ${YELLOW}⚠${RESET} $1"; }
+print_info()  { echo -e "  ${DIM}→${RESET} $1"; }
+print_success() { echo -e "\n${BG_GREEN}${WHITE}  ✓ $1  ${RESET}\n"; }
+print_failure() { echo -e "\n${BG_RED}${WHITE}  ✗ $1  ${RESET}\n" >&2; }
+print_subheader() { echo -e "\n${MAGENTA}┌─ $1${RESET}"; }
+print_subitem()   { echo -e "${MAGENTA}│${RESET}  $1"; }
+print_subfooter() { echo -e "${MAGENTA}└─────────────────────────────────────────────────────────────${RESET}"; }
+
+# ── Version selection ────────────────────────────────────────────────────────
+TARGET_VERSION="${1:-latest}"
+if [ "$TARGET_VERSION" = "latest" ]; then VERSION_DISPLAY="latest"; else VERSION_DISPLAY="v$TARGET_VERSION"; fi
+
+print_header "🚀 DeepSeek DSH Installer for Android/Termux"
+echo -e "${BOLD}Target version:${RESET} ${GREEN}$VERSION_DISPLAY${RESET}"
+echo -e "${BOLD}Date:${RESET} $(date '+%Y-%m-%d %H:%M:%S')"
+echo -e "${DIM}─────────────────────────────────────────────────────────────────${RESET}"
+
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+PATCHER="$REPO_DIR/scripts/apply-termux-fixes.mjs"
 
 if [ "$(uname -o 2>/dev/null)" != "Android" ]; then
-    echo "  [WARN] This script is designed for Termux (Android)."
-    echo "  [WARN] Continuing anyway; native builds may fail on other platforms."
+    print_warn "This script is designed for Termux (Android). Continuing anyway."
 fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+pkg_installed() { dpkg -s "$1" > /dev/null 2>&1; }
+cmd_exists()    { command -v "$1" > /dev/null 2>&1; }
 
-pkg_installed() {
-    dpkg -s "$1" > /dev/null 2>&1
+# koffi >=3 places the built addon under a version-dependent path.
+find_koffi_node() {
+    find "$1/build" -type f -name 'koffi.node' 2>/dev/null | head -1
 }
 
-cmd_exists() {
-    command -v "$1" > /dev/null 2>&1
-}
+# ── Step 0: system dependencies ──────────────────────────────────────────────
+print_step "0/8" "Checking & installing system dependencies"
 
-apply_patch() {
-    # apply_patch <patch-file> <package-dir>
-    # Returns 0 when the patch was applied NOW, 1 when it was skipped
-    # (already applied, inapplicable, or missing target).
-    local patch="$1" dir="$2"
-    if [ ! -f "$patch" ]; then
-        echo "  [WARN] patch file missing: $patch"
-        return 1
-    fi
-    if [ ! -d "$dir" ]; then
-        echo "  [WARN] $(basename "$patch"): package dir not found ($dir) — skipping"
-        return 1
-    fi
-    if (cd "$dir" && patch -p1 --dry-run --forward < "$patch" > /dev/null 2>&1); then
-        (cd "$dir" && patch -p1 --forward < "$patch" > /dev/null 2>&1)
-        echo "  [OK] $(basename "$patch") -> $(basename "$dir")"
-        return 0
-    fi
-    echo "  [SKIP] $(basename "$patch") already applied or inapplicable ($dir)"
-    return 1
-}
+print_info "Refreshing package lists (pkg update)..."
+if pkg update -y 2>&1 | sed 's/^/    /'; then print_ok "Package lists refreshed."
+else print_warn "pkg update failed — continuing with existing lists"; fi
 
-# ── Step 0: Install system dependencies ─────────────────────────────────────
-echo "==> [0/9] Checking & installing system dependencies..."
-
-# Refresh package lists first. Stale lists are a common cause of "package not
-# found" / broken dependency resolution on older setups; if the refresh fails
-# we still continue with whatever lists exist (offline-friendly).
-echo "  -> Refreshing package lists (pkg update)..."
-if pkg update -y; then
-    echo "  [OK] package lists refreshed."
-else
-    echo "  [WARN] pkg update failed — continuing with existing lists"
-fi
-
-# Core packages required by the installer and the native builds. If any of
-# these fails, install.sh aborts below with a clear message.
-SYSTEM_PKGS=(
-    ndk-sysroot    # Android platform headers/libs (bionic sysroot: stdio.h etc.)
-    clang          # C/C++ compiler (LLVM/Clang for Termux)
-    binutils       # ar, strip, etc. (needed by node-gyp)
-    cmake          # Native addon build system (koffi)
-    make           # Build tool
-    python3        # node-gyp/gyp configure scripts
-    pkg-config     # Library discovery
-    patch          # Apply source patches
-    git            # Version check / metadata / git-hosted plugins
-    proot          # User-space chroot for bash sandbox (Android fallback)
-    nodejs         # Node.js runtime
-    npm            # Package manager
-    curl           # Header tarball downloads
-    which          # command -v fallback / diagnostics
-)
-
+print_subheader "Required packages"
+SYSTEM_PKGS=(ndk-sysroot clang binutils cmake make python3 pkg-config patch git proot nodejs npm curl which)
 PKGS_TO_INSTALL=()
 for pkg in "${SYSTEM_PKGS[@]}"; do
-    if pkg_installed "$pkg"; then
-        echo "  [OK] $pkg"
-    else
-        echo "  [MISS] $pkg"
-        PKGS_TO_INSTALL+=("$pkg")
-    fi
+    if pkg_installed "$pkg"; then print_ok "$pkg ${DIM}(installed)${RESET}"
+    else print_warn "$pkg ${DIM}(missing)${RESET}"; PKGS_TO_INSTALL+=("$pkg"); fi
 done
 
 if [ ${#PKGS_TO_INSTALL[@]} -gt 0 ]; then
-    echo "  -> Installing: ${PKGS_TO_INSTALL[*]}"
-    if ! pkg install -y "${PKGS_TO_INSTALL[@]}"; then
-        echo ""
-        echo "  [ERROR] pkg install failed. Common fixes:"
-        echo "  - Run 'pkg upgrade -y' once (stale/broken packages block installs)"
-        echo "  - Run 'pkg install -y ${PKGS_TO_INSTALL[*]}' manually to see the real error"
-        echo "  - Check your network / Termux mirrors (termux-change-repo)"
+    print_info "Installing: ${PKGS_TO_INSTALL[*]}"
+    if ! pkg install -y "${PKGS_TO_INSTALL[@]}" 2>&1 | sed 's/^/    /'; then
+        print_error "pkg install failed. Common fixes:"
+        echo -e "  ${YELLOW}•${RESET} Run 'pkg upgrade -y' once (stale/broken packages block installs)"
+        echo -e "  ${YELLOW}•${RESET} Run 'pkg install -y ${PKGS_TO_INSTALL[*]}' manually to see the real error"
+        echo -e "  ${YELLOW}•${RESET} Check your network / Termux mirrors (termux-change-repo)"
         exit 1
     fi
-    echo "  [OK] System dependencies installed."
+    print_ok "System dependencies installed."
 else
-    echo "  [OK] All system dependencies satisfied."
+    print_ok "All system dependencies satisfied."
 fi
 
-# Optional-but-recommended packages: not present in every Termux repo, so a
-# failure here is non-fatal.
-#   ndk-multilib:    multi-ABI NDK toolchain at $PREFIX/opt/ndk-multilib.
-#                    Provides the sysroot/headers/libs some devices need for
-#                    native compilation (verified on low-Android setups).
-#   libandroid-spawn: posix_spawn() shim for old Android bionic; lets builds
-#                    link with -landroid-spawn when present.
-if ! pkg_installed ndk-multilib; then
-    echo "  -> Installing ndk-multilib (multi-ABI NDK toolchain)..."
-    pkg install -y ndk-multilib > /dev/null 2>&1 \
-        && echo "  [OK] ndk-multilib installed" \
-        || echo "  [WARN] ndk-multilib unavailable — continuing without it"
-fi
-if ! pkg_installed libandroid-spawn; then
-    echo "  -> Installing libandroid-spawn (posix_spawn shim)..."
-    pkg install -y libandroid-spawn > /dev/null 2>&1 \
-        && echo "  [OK] libandroid-spawn installed" \
-        || echo "  [WARN] libandroid-spawn unavailable — continuing without it"
-fi
-
-TOOLS=(clang clang++ ar cmake make pkg-config patch git python3 node npm curl which)
-TOOLS_MISSING=false
-for tool in "${TOOLS[@]}"; do
-    if cmd_exists "$tool"; then
-        echo "  [OK] $tool ($(command -v "$tool"))"
-    else
-        echo "  [WARN] $tool not found on PATH — may cause build failures"
-        TOOLS_MISSING=true
-    fi
+print_subheader "Optional packages"
+for opt in ndk-multilib libandroid-spawn ripgrep; do
+    if pkg_installed "$opt"; then print_ok "$opt ${DIM}(installed)${RESET}"; continue; fi
+    print_info "Installing $opt..."
+    if pkg install -y "$opt" > /dev/null 2>&1; then print_ok "$opt installed"
+    else print_warn "$opt unavailable — continuing without it"; fi
 done
 
-if $TOOLS_MISSING; then
-    echo "  [INFO] Some tools are missing; continuing anyway (they may be installed by pkg hooks)"
-fi
+print_subheader "Tool verification"
+TOOLS=(clang clang++ ar cmake make pkg-config patch git python3 node npm curl which rg)
+TOOLS_MISSING=false
+for tool in "${TOOLS[@]}"; do
+    if cmd_exists "$tool"; then print_ok "$tool ${DIM}($(command -v "$tool"))${RESET}"
+    else print_warn "$tool not found on PATH — may cause failures"; TOOLS_MISSING=true; fi
+done
+$TOOLS_MISSING && print_info "Some tools are missing; continuing anyway."
 
-# ── Step 1: Configure the native build environment (BEFORE anything compiles) ─
-echo "==> [1/9] Configuring native addon build environment..."
+# ── Step 1: native build environment ─────────────────────────────────────────
+print_step "1/8" "Configuring native addon build environment"
 
-# node-pty/koffi build via gyp: on Termux, gyp sees OS=android (python3 reports
-# sys.platform='android') and node's stock common.gypi has an android branch
-# that references <(android_ndk_path) with NO default value ->
-# "gyp: Undefined variable android_ndk_path". Termux has no standalone Google
-# NDK metadata; the Bionic sysroot comes from the ndk-sysroot package. We
-# therefore always pin android_ndk_path via GYP_DEFINES (gyp's official -D
-# channel, read via ShlexEnv — inherited by every node-gyp/gyp child):
-#   - when ndk-multilib is installed we point it at
-#     $PREFIX/opt/ndk-multilib (community-tested on low-Android devices),
-#   - otherwise we pin it to empty, which is equally fine (the referenced
-#     -I<path>/sources/... directory does not exist either way).
-# A default value is ALSO patched into node's cached common.gypi (Step 2) to
-# cover manual rebuilds where GYP_DEFINES may be unset.
 NDK_MULTILIB="${PREFIX:-/data/data/com.termux/files/usr}/opt/ndk-multilib"
 if [ -d "$NDK_MULTILIB" ]; then
-    export ANDROID_NDK_HOME="$NDK_MULTILIB"
-    export ANDROID_NDK_ROOT="$NDK_MULTILIB"
+    export ANDROID_NDK_HOME="$NDK_MULTILIB" ANDROID_NDK_ROOT="$NDK_MULTILIB"
     export GYP_DEFINES="${GYP_DEFINES:+$GYP_DEFINES }android_ndk_path=$NDK_MULTILIB"
-    echo "  [OK] ndk-multilib NDK detected: $NDK_MULTILIB"
-    echo "  [OK] ANDROID_NDK_HOME/ROOT + android_ndk_path -> $NDK_MULTILIB"
+    print_ok "ndk-multilib NDK detected: ${CYAN}$NDK_MULTILIB${RESET}"
 else
-    # A stale/foreign NDK env var would make gyp/node-gyp attempt cross-
-    # compilation — unset when we have no NDK to point them at.
-    unset ANDROID_NDK_HOME
-    unset ANDROID_NDK_ROOT
+    unset ANDROID_NDK_HOME ANDROID_NDK_ROOT
     export GYP_DEFINES="${GYP_DEFINES:+$GYP_DEFINES }android_ndk_path="
+    print_info "No NDK detected — using system Bionic sysroot"
 fi
-echo "  [OK] GYP_DEFINES='$GYP_DEFINES'"
+print_ok "GYP_DEFINES='${CYAN}$GYP_DEFINES${RESET}'"
 
-# NOTE: do NOT export -D defines in CFLAGS/CXXFLAGS here. A global
-# "-D__ANDROID_API__=30" (or any -D) leaks into cmake-based builds (koffi) via
-# the CFLAGS env var and breaks them: Termux's bionic/libc++ headers use clang
-# availability checks against the target (android24), so strtof_l()/
-# pthread_cond_clockwait() etc. error out. Termux clang's default target
-# already works for node-pty and koffi, and the native builds below scrub
-# CFLAGS/CXXFLAGS/CPPFLAGS from their own environment.
-#
-# We DO export LDFLAGS=-landroid-spawn when libandroid-spawn is installed:
-# that shim provides posix_spawn() on old Android bionic and is consumed by
-# cmake (koffi) during linking. Harmless when the library is absent — we only
-# set it when the .so exists.
 if [ -f "${PREFIX:-/data/data/com.termux/files/usr}/lib/libandroid-spawn.so" ]; then
     export LDFLAGS="${LDFLAGS:+$LDFLAGS }-landroid-spawn"
-    echo "  [OK] LDFLAGS='$LDFLAGS' (libandroid-spawn)"
+    print_ok "LDFLAGS='${CYAN}$LDFLAGS${RESET}' ${DIM}(libandroid-spawn)${RESET}"
 fi
 
-# node-gyp python discovery: export a deterministic interpreter.
 export PYTHON="${PYTHON:-$(command -v python3 || command -v python || echo python3)}"
-echo "  [OK] PYTHON=$PYTHON"
-
-export CC="${CC:-clang}"
-export CXX="${CXX:-clang++}"
-echo "  [OK] CC = $(command -v "$CC" 2>/dev/null || echo "$CC (not on PATH yet)")"
-echo "  [OK] CXX = $(command -v "$CXX" 2>/dev/null || echo "$CXX (not on PATH yet)")"
+export CC="${CC:-clang}" CXX="${CXX:-clang++}"
+print_ok "PYTHON=${CYAN}$PYTHON${RESET}  CC=${CYAN}$CC${RESET}  CXX=${CYAN}$CXX${RESET}"
 
 NODE_VER="$(node -v 2>/dev/null | sed 's/^v//' || true)"
-if [ -z "$NODE_VER" ]; then
-    echo "  [ERROR] node not found after package install — aborting"
-    exit 1
-fi
+[ -n "$NODE_VER" ] || { print_error "node not found after package install — aborting"; exit 1; }
+print_ok "Node.js version: ${CYAN}v$NODE_VER${RESET}"
 NODE_GYP_CACHE="$HOME/.cache/node-gyp/$NODE_VER"
-# Note: we deliberately do NOT export npm_config_nodedir. The pre-seeded cache
-# below is found by node-gyp on its own, and exporting npm_config_nodedir makes
-# every later npm invocation print "npm warn Unknown env config nodedir".
 
-# ── Step 2: Pre-seed node headers + patch common.gypi ───────────────────────
-echo "==> [2/9] Ensuring node-gyp headers & patching common.gypi..."
+# ── Step 2: node headers + common.gypi ───────────────────────────────────────
+print_step "2/8" "Ensuring node-gyp headers & patching common.gypi"
 
-# node-gyp needs the node development headers under ~/.cache/node-gyp/<ver>.
-# On a fresh device this cache is empty and node-gyp would download them from
-# nodejs.org DURING the npm install — a frequent failure point (slow/blocked
-# network in some regions -> "node.h: No such file or directory"). We download
-# them up front with a China mirror fallback (npmmirror mirrors nodejs.org).
 if [ -d "$NODE_GYP_CACHE/include/node" ]; then
-    echo "  [OK] node-gyp headers cache present ($NODE_VER)"
+    print_ok "node-gyp headers cache present ${DIM}($NODE_VER)${RESET}"
 else
-    echo "  -> Downloading node headers v$NODE_VER (mirror fallback)..."
+    print_info "Downloading node headers v$NODE_VER (mirror fallback)..."
     _headers_ok=false
-    _tmp="$(mktemp -d)"
-    _tar="$_tmp/node-v$NODE_VER-headers.tar.gz"
-    for _base in "https://nodejs.org/download/release/v$NODE_VER" \
-                 "https://npmmirror.com/mirrors/node/v$NODE_VER"; do
+    _tmp="$(mktemp -d)"; _tar="$_tmp/node-v$NODE_VER-headers.tar.gz"
+    for _base in "https://nodejs.org/download/release/v$NODE_VER" "https://npmmirror.com/mirrors/node/v$NODE_VER"; do
         _url="$_base/node-v$NODE_VER-headers.tar.gz"
-        echo "  [INFO] trying $_url"
-        if curl -fsSL --connect-timeout 15 --max-time 600 -o "$_tar" "$_url"; then
+        print_info "Trying $_url"
+        if curl -fsSL --connect-timeout 15 --max-time 600 -o "$_tar" "$_url" 2>&1 | sed 's/^/      /'; then
             mkdir -p "$NODE_GYP_CACHE"
-            tar -xzf "$_tar" -C "$_tmp"
+            tar -xzf "$_tar" -C "$_tmp" 2>&1 | sed 's/^/      /'
             cp -R "$_tmp/node-v$NODE_VER/include" "$NODE_GYP_CACHE/"
-            # node-gyp only trusts a cache dir marked complete via installVersion
             _iv="$(node -p "require('$(npm root -g 2>/dev/null)/npm/node_modules/node-gyp/package.json').installVersion" 2>/dev/null || echo 9)"
             echo "$_iv" > "$NODE_GYP_CACHE/installVersion"
-            rm -rf "$_tmp"
-            echo "  [OK] node headers installed to $NODE_GYP_CACHE"
-            _headers_ok=true
-            break
+            rm -rf "$_tmp"; print_ok "Node headers installed to $NODE_GYP_CACHE"; _headers_ok=true; break
         fi
-        echo "  [WARN] download failed: $_url"
+        print_warn "Download failed: $_url"
     done
     rm -rf "$_tmp"
     if ! $_headers_ok; then
-        echo "  [ERROR] Could not download node headers for v$NODE_VER"
-        echo "  [ERROR] Fix your network, then re-run install.sh (or set"
-        echo "  [ERROR] npm_config_nodedir to a local node dev dir)."
-        exit 1
+        print_error "Could not download node headers for v$NODE_VER"; print_error "Fix your network, then re-run install.sh"; exit 1
     fi
 fi
 
-# Belt-and-suspenders: patch node's cached common.gypi so android_ndk_path has
-# a default empty value. The stock file references <(android_ndk_path) in its
-# OS=="android" branch but declares no default, which makes ANY plain
-# `node-gyp rebuild` (GYP_DEFINES unset) fail with
-# "gyp: Undefined variable android_ndk_path".
-# NOTE: the awk pattern must match the QUOTED key line "  'variables': {".
 _common_gypi="$NODE_GYP_CACHE/include/node/common.gypi"
-if [ -f "$_common_gypi" ] && grep -q 'android_ndk_path' "$_common_gypi" \
-    && ! grep -q "'android_ndk_path%'" "$_common_gypi"; then
+if [ -f "$_common_gypi" ] && grep -q 'android_ndk_path' "$_common_gypi" && ! grep -q "'android_ndk_path%'" "$_common_gypi"; then
+    print_info "Patching common.gypi with android_ndk_path default..."
     awk '
         /^[[:space:]]*'"'"'?variables'"'"'?[[:space:]]*:[[:space:]]*\{/ && !_done {
-            print
-            print "    '"'"'android_ndk_path%'"'"': '"'"''"'"',        # Termux: default empty (no NDK metadata)"
-            _done=1
-            next
+            print; print "    '"'"'android_ndk_path%'"'"': '"'"''"'"',        # Termux: default empty (no NDK metadata)"; _done=1; next
         }
         { print }
     ' "$_common_gypi" > "$_common_gypi.tmp" && mv "$_common_gypi.tmp" "$_common_gypi"
-    if grep -q "'android_ndk_path%'" "$_common_gypi"; then
-        echo "  [OK] patched android_ndk_path default into $_common_gypi"
-    else
-        echo "  [WARN] common.gypi patch did not apply (awk regex mismatch?) —"
-        echo "  [WARN] builds still work via GYP_DEFINES, but manual rebuilds may fail"
-    fi
+    grep -q "'android_ndk_path%'" "$_common_gypi" && print_ok "Patched android_ndk_path default" || print_warn "common.gypi patch did not apply"
 elif [ -f "$_common_gypi" ]; then
-    echo "  [OK] common.gypi already patched (android_ndk_path default present)"
+    print_ok "common.gypi already patched"
 fi
 
-# ── Step 3: npm install (download only, no compile yet) ─────────────────────
-echo "==> [3/9] Installing @deepseek-ai/dsh globally (no scripts)..."
+# ── Step 3: npm install dsh ──────────────────────────────────────────────────
+print_step "3/8" "Installing @deepseek-ai/dsh (no scripts)"
 
-# Multi-source download: official npm registry first, npmmirror (China) as
-# fallback. --ignore-scripts defers ALL native compilation to Step 5, where
-# the environment and source patches are ready. --foreground-scripts +
-# --loglevel verbose keep progress visible. A stall watchdog kills npm if it
-# produces no output for NPM_INSTALL_TIMEOUT seconds and tries the next source.
-
-NPM_INSTALL_TIMEOUT="${NPM_INSTALL_TIMEOUT:-600}"   # seconds without output
-NPM_MIRRORS=(
-    "https://registry.npmjs.org"
-    "https://registry.npmmirror.com"
-)
+NPM_INSTALL_TIMEOUT="${NPM_INSTALL_TIMEOUT:-600}"
+NPM_MIRRORS=("https://registry.npmjs.org" "https://registry.npmmirror.com")
 NPM_LOG_FILE="${PREFIX:-/data/data/com.termux/files/usr}/tmp/dsh-npm-install.log"
-
 DSH_DIR="$(npm root -g)/@deepseek-ai/dsh"
 
-# Fast path: if the installed version already matches the latest release, skip
-# the npm install entirely. Re-running `npm install -g` re-extracts all 500+
-# packages (wiping our patches and native builds, which then all get redone),
-# so this check is what makes re-runs of install.sh truly fast and idempotent.
-# The patch/build steps below are themselves skip-aware and cover a partial
-# or broken previous install (missing pty.node/koffi.node get rebuilt).
 DSH_INSTALL_OK=false
 if [ -f "$DSH_DIR/package.json" ]; then
     _installed_ver="$(node -p "require('$DSH_DIR/package.json').version" 2>/dev/null || true)"
-    _latest_ver="$(npm view @deepseek-ai/dsh version 2>/dev/null || true)"
-    if [ -n "$_installed_ver" ] && [ "$_installed_ver" = "$_latest_ver" ]; then
-        echo "  [SKIP] @deepseek-ai/dsh@$_installed_ver already installed (latest) — skipping npm install"
-        DSH_INSTALL_OK=true
-    else
-        echo "  [INFO] installed=$_installed_ver latest=$_latest_ver — installing @deepseek-ai/dsh@latest"
-    fi
-fi
-
-if ! $DSH_INSTALL_OK; then
-for _registry in "${NPM_MIRRORS[@]}"; do
-    echo "" > "$NPM_LOG_FILE"
-    {
-        npm install -g --ignore-scripts @deepseek-ai/dsh@latest \
-            --registry="$_registry" \
-            --foreground-scripts \
-            --loglevel verbose
-    } > >(tee "$NPM_LOG_FILE") 2>&1 &
-    _npm_pid=$!
-
-    # Watchdog: no output for NPM_INSTALL_TIMEOUT seconds => kill, next mirror
-    _last_size=0 _stable_count=0
-    while kill -0 "$_npm_pid" 2>/dev/null; do
-        sleep 10
-        _cur_size=$(stat -c %s "$NPM_LOG_FILE" 2>/dev/null || echo 0)
-        if [ "$_cur_size" -eq "$_last_size" ]; then
-            _stable_count=$((_stable_count + 1))
-            _elapsed=$((_stable_count * 10))
-            echo "  [INFO] No output for ${_elapsed}s (download stalled?)..."
-            if [ "$_elapsed" -ge "$NPM_INSTALL_TIMEOUT" ]; then
-                echo "  [ERROR] npm install produced no output for ${NPM_INSTALL_TIMEOUT}s — killing"
-                echo "  [DIAG] Network check:"
-                curl -sS --connect-timeout 5 -o /dev/null -w "    HTTP %{http_code} (%{time_total}s)" "$_registry" 2>&1 || echo "    UNREACHABLE"
-                echo ""
-                kill -TERM "$_npm_pid" 2>/dev/null
-                sleep 2
-                kill -KILL "$_npm_pid" 2>/dev/null
-                wait "$_npm_pid" 2>/dev/null || true
-                continue 2
-            fi
+    if [ "$TARGET_VERSION" = "latest" ]; then
+        _latest_ver="$(npm view @deepseek-ai/dsh version 2>/dev/null || true)"
+        if [ -n "$_installed_ver" ] && [ "$_installed_ver" = "$_latest_ver" ]; then
+            print_ok "@deepseek-ai/dsh@$_installed_ver already installed (latest) — skipping npm install"; DSH_INSTALL_OK=true
         else
-            _stable_count=0
+            print_info "installed=$_installed_ver latest=$_latest_ver — installing @deepseek-ai/dsh@latest"
         fi
-        _last_size="$_cur_size"
-    done
-
-    if wait "$_npm_pid"; then
-        DSH_INSTALL_OK=true
-        break
+    elif [ -n "$_installed_ver" ] && [ "$_installed_ver" = "$TARGET_VERSION" ]; then
+        print_ok "@deepseek-ai/dsh@$_installed_ver already installed — skipping npm install"; DSH_INSTALL_OK=true
+    else
+        print_info "installed=$_installed_ver target=$TARGET_VERSION — installing @deepseek-ai/dsh@$TARGET_VERSION"
     fi
-done
 fi
 
 if ! $DSH_INSTALL_OK; then
-    echo "  [ERROR] All registries failed. Last resort: default npm settings"
-    npm install -g --ignore-scripts @deepseek-ai/dsh@latest && DSH_INSTALL_OK=true
+    if [ "$TARGET_VERSION" = "latest" ]; then PKG_SPEC="@deepseek-ai/dsh@latest"; else PKG_SPEC="@deepseek-ai/dsh@$TARGET_VERSION"; fi
+
+    for _registry in "${NPM_MIRRORS[@]}"; do
+        echo "" > "$NPM_LOG_FILE"
+        print_info "Trying registry: $_registry"
+        { npm install -g --ignore-scripts "$PKG_SPEC" --registry="$_registry" --foreground-scripts --loglevel verbose; } > >(tee "$NPM_LOG_FILE") 2>&1 &
+        _npm_pid=$!
+        _last_size=0 _stable_count=0
+        while kill -0 "$_npm_pid" 2>/dev/null; do
+            sleep 10
+            _cur_size=$(stat -c %s "$NPM_LOG_FILE" 2>/dev/null || echo 0)
+            if [ "$_cur_size" -eq "$_last_size" ]; then
+                _stable_count=$((_stable_count + 1)); _elapsed=$((_stable_count * 10))
+                printf "\r  ${DIM}No output for ${_elapsed}s (download stalled?)...${RESET}   "
+                if [ "$_elapsed" -ge "$NPM_INSTALL_TIMEOUT" ]; then
+                    echo ""; print_error "npm install produced no output for ${NPM_INSTALL_TIMEOUT}s — killing"
+                    kill -TERM "$_npm_pid" 2>/dev/null; sleep 2; kill -KILL "$_npm_pid" 2>/dev/null
+                    wait "$_npm_pid" 2>/dev/null || true; continue 2
+                fi
+            else
+                _stable_count=0; printf "\r  ${GREEN}✓${RESET} ${DIM}Downloading...${RESET}        "
+            fi
+            _last_size="$_cur_size"
+        done
+        echo ""
+        if wait "$_npm_pid"; then DSH_INSTALL_OK=true; print_ok "Installation from $_registry successful"; break; fi
+    done
 fi
 
 if ! $DSH_INSTALL_OK; then
-    echo "  [ERROR] npm install failed from all sources"
-    echo "  Try manually: npm install -g @deepseek-ai/dsh@latest"
-    echo "  Or with mirror: npm install -g @deepseek-ai/dsh@latest --registry=https://registry.npmmirror.com"
-    exit 1
+    print_error "All registries failed. Last resort: default npm settings"
+    npm install -g --ignore-scripts "$PKG_SPEC" && DSH_INSTALL_OK=true
+fi
+if ! $DSH_INSTALL_OK; then
+    print_error "npm install failed from all sources"
+    echo -e "  Try manually: ${CYAN}npm install -g $PKG_SPEC${RESET}"; exit 1
 fi
 
 DSH_PKGS="$DSH_DIR/node_modules/@deepseek-ai"
-echo "  [OK] Package installed at: $DSH_DIR"
+print_ok "Package installed at: ${CYAN}$DSH_DIR${RESET}"
 
-# ── Step 4: Apply Android source patches ────────────────────────────────────
-echo "==> [4/9] Applying Android platform patches..."
+# ── Step 4: build native addons ──────────────────────────────────────────────
+print_step "4/8" "Building native addons"
 
-# Note: apply_patch returns 1 for "already applied / inapplicable" — under
-# `set -e` a top-level non-zero return would abort the script, so the plain
-# patch calls are guarded with `|| true` (their messages still print).
-apply_patch "$REPO_DIR/patches/01-terminal-bash-android-shell.patch"         "$DSH_PKGS/dsh-terminal-bash" || true
-apply_patch "$REPO_DIR/patches/02-session-persistence-link-rename.patch"      "$DSH_PKGS/dsh-session-persistence-jsonl" || true
-apply_patch "$REPO_DIR/patches/03-subprocess-local-android.patch"             "$DSH_PKGS/dsh-subprocess-local" || true
-apply_patch "$REPO_DIR/patches/04-host-apiproxy-termux-open-index.patch"      "$DSH_PKGS/dsh-host-apiproxy" || true
-apply_patch "$REPO_DIR/patches/04-host-apiproxy-termux-open-opener.patch"     "$DSH_PKGS/dsh-host-apiproxy" || true
-apply_patch "$REPO_DIR/patches/05-host-directory-picker-native-android.patch" "$DSH_PKGS/dsh-host-directory-picker-native" || true
-apply_patch "$REPO_DIR/patches/06-workspace-archive-skip-session-known-check.patch" "$DSH_PKGS/dsh-workspace" || true
-apply_patch "$REPO_DIR/patches/07-sandbox-local-proot-runner.patch"           "$DSH_PKGS/dsh-sandbox-local" || true
-apply_patch "$REPO_DIR/patches/08-dsh-tool-fs-search-android-rg.patch"         "$DSH_PKGS/dsh-tool-fs-search" || true
-
-# ripgrep platform-package shim: @vscode/ripgrep resolves
-# @vscode/ripgrep-${platform}-${arch}, which for Termux is
-# @vscode/ripgrep-android-arm64 — a package that does not exist. Without it,
-# the glob/grep tools fail with "ripgrep launch failed" in every fresh
-# process. Create the shim (bin/rg -> system rg) so require.resolve() (the
-# patched resolveRgPath in 08-*.patch) finds a binary. Idempotent.
-RG_SHIM="$DSH_PKGS/../@vscode/ripgrep-android-arm64"
-RG_SYSTEM="${RG_SYSTEM:-/data/data/com.termux/files/usr/bin/rg}"
-if [ -x "$RG_SYSTEM" ]; then
-    if [ ! -f "$RG_SHIM/package.json" ]; then
-        mkdir -p "$RG_SHIM/bin"
-        cat > "$RG_SHIM/package.json" <<EOF
-{
-  "name": "@vscode/ripgrep-android-arm64",
-  "version": "1.18.0",
-  "description": "Termux shim: resolves rgPath to the system ripgrep ($RG_SYSTEM); @vscode/ripgrep has no android platform package.",
-  "license": "MIT",
-  "bin": { "rg": "bin/rg" }
-}
-EOF
-        ln -sf "$RG_SYSTEM" "$RG_SHIM/bin/rg"
-        echo "  [OK] ripgrep android shim -> $RG_SYSTEM"
-    else
-        echo "  [SKIP] ripgrep android shim already present"
-    fi
-else
-    echo "  [WARN] system rg not found at $RG_SYSTEM — glob/grep tools need it (pkg install ripgrep)"
-fi
-
-# ── Step 5: Build native addons (koffi first — its statx() patch must be     ─
-#            baked into the binary) ───────────────────────────────────────────
-echo "==> [5/9] Building native addons..."
-
-# node-gyp wrapper shipped with npm, for manual rebuilds
 NODE_GYP_BIN="$(dirname "$(dirname "$(command -v npm)")")/lib/node_modules/npm/bin/node-gyp-bin"
-if [ -d "$NODE_GYP_BIN" ]; then
-    export PATH="$NODE_GYP_BIN:$PATH"
-fi
+[ -d "$NODE_GYP_BIN" ] && export PATH="$NODE_GYP_BIN:$PATH"
 
-# 5a. koffi — apply the statx() Android patch BEFORE compiling, then build.
 KOFFI_DIR="$DSH_DIR/node_modules/koffi"
-KOFFI_OUT="$KOFFI_DIR/build/koffi/android_arm64/koffi.node"
+KOFFI_CANONICAL="$KOFFI_DIR/build/koffi/android_arm64/koffi.node"
 KOFFI_BUILD=false
-if apply_patch "$REPO_DIR/patches/koffi-statx.patch" "$KOFFI_DIR"; then
-    KOFFI_BUILD=true
-elif [ ! -f "$KOFFI_OUT" ]; then
-    KOFFI_BUILD=true
+
+print_subheader "Building koffi native library"
+if [ -f "$REPO_DIR/patches/koffi-statx.patch" ] && (cd "$KOFFI_DIR" && patch -p1 --dry-run --forward < "$REPO_DIR/patches/koffi-statx.patch" > /dev/null 2>&1); then
+    (cd "$KOFFI_DIR" && patch -p1 --forward < "$REPO_DIR/patches/koffi-statx.patch" > /dev/null 2>&1)
+    KOFFI_BUILD=true; print_ok "koffi-statx.patch applied"
+elif [ ! -f "$KOFFI_CANONICAL" ] && [ -z "$(find_koffi_node "$KOFFI_DIR")" ]; then
+    KOFFI_BUILD=true; print_info "koffi.node missing — building from source"
+else
+    print_ok "koffi already built with patched sources."
 fi
+
 if $KOFFI_BUILD; then
-    echo "  -> Building koffi native lib (this takes a while)..."
-    # Scrub CFLAGS/CXXFLAGS/CPPFLAGS: a user-level -D__ANDROID_API__ or other
-    # define would leak into cmake via the env and break the build (bionic
-    # availability checks vs. the android24 target).
-    if (cd "$KOFFI_DIR" && env -u CFLAGS -u CXXFLAGS -u CPPFLAGS \
-            node ./cnoke.cjs -P . -D src/koffi --prebuild --release); then
-        echo "  [OK] koffi native lib built."
+    print_info "Building koffi native lib (this takes a while)..."
+    if (cd "$KOFFI_DIR" && env -u CFLAGS -u CXXFLAGS -u CPPFLAGS node ./cnoke.cjs -P . -D src/koffi --prebuild --release 2>&1 | sed 's/^/    /'); then
+        _found="$(find_koffi_node "$KOFFI_DIR")"
+        if [ -n "$_found" ] && [ "$_found" != "$KOFFI_CANONICAL" ]; then
+            mkdir -p "$(dirname "$KOFFI_CANONICAL")"; cp -f "$_found" "$KOFFI_CANONICAL"
+            print_ok "koffi.node copied: $_found -> $KOFFI_CANONICAL"
+        fi
+        print_ok "koffi native lib built."
     else
-        echo "  [ERROR] koffi build failed!"
-        echo "  Common causes: missing cmake (pkg install cmake), missing"
-        echo "  ndk-sysroot (pkg install ndk-sysroot), a CFLAGS/CXXFLAGS"
-        echo "  override in your environment, or no network for the koffi"
-        echo "  prebuild download."
+        print_error "koffi build failed!"
+        echo -e "  ${YELLOW}•${RESET} Missing cmake: ${CYAN}pkg install cmake${RESET}"
+        echo -e "  ${YELLOW}•${RESET} Missing ndk-sysroot: ${CYAN}pkg install ndk-sysroot${RESET}"
+        echo -e "  ${YELLOW}•${RESET} CFLAGS/CXXFLAGS override in your environment"
         exit 1
     fi
-else
-    echo "  [SKIP] koffi already built with patched sources."
 fi
+KOFFI_OUT="$(find_koffi_node "$KOFFI_DIR")"; [ -n "$KOFFI_OUT" ] || KOFFI_OUT="$KOFFI_CANONICAL"
 
-# 5b. node-pty — compile against the Termux bionic sysroot.
 PTY_DIR="$DSH_DIR/node_modules/node-pty"
+print_subheader "Building node-pty"
 if [ -f "$PTY_DIR/build/Release/pty.node" ]; then
-    echo "  [SKIP] pty.node already built."
+    print_ok "pty.node already built."
 else
-    echo "  -> Building node-pty (Termux bionic target)..."
-    if (cd "$PTY_DIR" && env -u CFLAGS -u CXXFLAGS -u CPPFLAGS node scripts/prebuild.js); then
-        echo "  [OK] node-pty prebuilt binary available."
-    elif (cd "$PTY_DIR" && env -u CFLAGS -u CXXFLAGS -u CPPFLAGS node-gyp rebuild --nodedir="$NODE_GYP_CACHE"); then
-        echo "  [OK] node-pty compiled."
+    print_info "Building node-pty (Termux bionic target)..."
+    if (cd "$PTY_DIR" && env -u CFLAGS -u CXXFLAGS -u CPPFLAGS node scripts/prebuild.js 2>&1 | sed 's/^/    /'); then
+        print_ok "node-pty prebuilt binary available."
+    elif (cd "$PTY_DIR" && env -u CFLAGS -u CXXFLAGS -u CPPFLAGS node-gyp rebuild --nodedir="$NODE_GYP_CACHE" 2>&1 | sed 's/^/    /'); then
+        print_ok "node-pty compiled."
     else
-        echo "  [ERROR] node-pty build failed!"
-        echo ""
-        echo "  Common causes and fixes:"
-        echo "  - Missing ndk-sysroot:  pkg install ndk-sysroot"
-        echo "  - Missing binutils:     pkg install binutils"
-        echo "  - Missing clang:        pkg install clang"
-        echo "  - Missing node headers: rm -rf $NODE_GYP_CACHE && re-run install.sh"
-        echo "  - android_ndk_path:     export GYP_DEFINES='android_ndk_path=' && retry"
-        echo ""
-        echo "  Last 20 lines of the build log:"
-        # shellcheck disable=SC2086
-        tail -20 "$PTY_DIR"/build/Release/obj.target/*.log 2>/dev/null || true
+        print_error "node-pty build failed!"
+        echo -e "  ${YELLOW}•${RESET} Missing ndk-sysroot: ${CYAN}pkg install ndk-sysroot${RESET}"
+        echo -e "  ${YELLOW}•${RESET} Missing binutils: ${CYAN}pkg install binutils${RESET}"
+        echo -e "  ${YELLOW}•${RESET} Missing node headers: ${CYAN}rm -rf $NODE_GYP_CACHE && re-run install.sh${RESET}"
         exit 1
     fi
 fi
 
-# 5c. Restore the executable bit of node-pty's spawn helper (npm strips it).
 SUB_DIR="$DSH_PKGS/dsh-subprocess-local"
 if [ -f "$SUB_DIR/scripts/ensure-spawn-helper.mjs" ]; then
-    (cd "$SUB_DIR" && node scripts/ensure-spawn-helper.mjs) && \
-        echo "  [OK] subprocess spawn-helper restored (chmod 755)"
+    (cd "$SUB_DIR" && node scripts/ensure-spawn-helper.mjs 2>&1 | sed 's/^/    /') && \
+        print_ok "subprocess spawn-helper restored (chmod 755)"
 fi
 
-# ── Step 6: Install sharp WebAssembly fallback ───────────────────────────────
-echo "==> [6/9] Installing sharp WebAssembly fallback..."
-if (cd "$DSH_DIR" && npm install @img/sharp-wasm32 > /dev/null 2>&1); then
-    echo "  [OK] @img/sharp-wasm32 installed."
+# ── Step 5: Termux runtime patches ───────────────────────────────────────────
+print_step "5/8" "Applying Termux/Android runtime patches"
+
+if [ ! -f "$PATCHER" ]; then
+    print_error "patcher not found: $PATCHER"; exit 1
+fi
+if node "$PATCHER"; then
+    print_ok "All Termux runtime patches applied."
 else
-    echo "  [WARN] Could not install @img/sharp-wasm32 (may already be present)."
-fi
-
-# ── Step 7: Install mobile-adaptive UI plugin ────────────────────────────────
-echo "==> [7/9] Installing dsh-web-mobile (mobile-adaptive UI plugin)..."
-# dsh-web-mobile by @mexiaosqwq: on narrow screens (<1024px) hides the sidebar
-# rail and turns the directory into an overlay drawer, giving the conversation
-# full width. Pure client plugin — no effect on desktop (>=1024px).
-# https://github.com/mexiaosqwq/dsh-web-mobile
-#
-# `dsh plugin --profile web add ...` initializes the profile on first use, so
-# there is no need to run `dsh web` beforehand. It forwards to pnpm, which must
-# be on PATH — install it if missing.
-
-DSH_HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
-WEB_PROFILE_DIR="$DSH_HOME_DIR/profiles/web"
-PLUGIN_CMD="node --expose-internals $DSH_DIR/lib/bin.js plugin --profile web add github:mexiaosqwq/dsh-web-mobile"
-
-if ! cmd_exists pnpm; then
-    echo "  -> Installing pnpm (required by the dsh plugin manager)..."
-    if npm install -g pnpm; then
-        echo "  [OK] pnpm installed ($(command -v pnpm))"
-    else
-        echo "  [WARN] pnpm install failed — the plugin step will fail without it"
-    fi
-fi
-
-if [ -f "$WEB_PROFILE_DIR/package.json" ] && grep -q "dsh-mobile-nav" "$WEB_PROFILE_DIR/package.json" 2>/dev/null; then
-    echo "  [SKIP] dsh-web-mobile already installed"
-elif node --expose-internals "$DSH_DIR/lib/bin.js" plugin --profile web add github:mexiaosqwq/dsh-web-mobile 2>&1; then
-    echo "  [OK] dsh-web-mobile installed"
-else
-    echo "  [WARN] dsh plugin add failed. Install it manually later with:"
-    echo "    $PLUGIN_CMD"
-fi
-
-# ── Step 8: Verify environment ───────────────────────────────────────────────
-echo "==> [8/9] Verifying environment..."
-NODE_VER_CUR=$(node -v 2>/dev/null || echo "not found")
-echo "  Node.js: $NODE_VER_CUR"
-echo "  dsh dir: $DSH_DIR"
-
-echo "  Native modules:"
-_NATIVE_MISSING=false
-if [ -f "$PTY_DIR/build/Release/pty.node" ]; then
-    echo "    [OK] node-pty pty.node"
-else
-    echo "    [MISS] node-pty pty.node"
-    _NATIVE_MISSING=true
-fi
-if [ -f "$KOFFI_OUT" ]; then
-    echo "    [OK] koffi android_arm64 koffi.node"
-else
-    echo "    [MISS] koffi android_arm64 koffi.node"
-    _NATIVE_MISSING=true
-fi
-if $_NATIVE_MISSING; then
-    echo ""
-    echo "  [ERROR] Native modules are missing — the install is incomplete."
-    echo "  Re-run install.sh; if it persists, capture the output above and"
-    echo "  open an issue at https://github.com/Vengisk/deepseek-harness-termux"
+    print_failure "Some patches failed — see the output above."
+    print_error "Do not start dsh web until every patch above is green."
     exit 1
 fi
 
-echo "  Patches:"
-for patch_file in "$REPO_DIR"/patches/*.patch; do
-    name="$(basename "$patch_file")"
-    # Strip the numeric prefix and extension, then map to the target package
-    pkg_name="$(echo "$name" | sed -E 's/^[0-9]+-//; s/\.patch$//')"
-    case "$pkg_name" in
-        terminal-bash-android-shell)                dir="$DSH_PKGS/dsh-terminal-bash" ;;
-        session-persistence-link-rename)            dir="$DSH_PKGS/dsh-session-persistence-jsonl" ;;
-        subprocess-local-android)                   dir="$DSH_PKGS/dsh-subprocess-local" ;;
-        host-apiproxy-termux-open-index)            dir="$DSH_PKGS/dsh-host-apiproxy" ;;
-        host-apiproxy-termux-open-opener)           dir="$DSH_PKGS/dsh-host-apiproxy" ;;
-        host-directory-picker-native-android)       dir="$DSH_PKGS/dsh-host-directory-picker-native" ;;
-        workspace-archive-skip-session-known-check) dir="$DSH_PKGS/dsh-workspace" ;;
-        sandbox-local-proot-runner)                 dir="$DSH_PKGS/dsh-sandbox-local" ;;
-        dsh-tool-fs-search-android-rg)              dir="$DSH_PKGS/dsh-tool-fs-search" ;;
-        koffi-statx)                                dir="$DSH_DIR/node_modules/koffi" ;;
-        *) dir="" ;;
-    esac
-    if [ -n "$dir" ] && [ -d "$dir" ]; then
-        if (cd "$dir" && patch -p1 --dry-run --reverse < "$patch_file" > /dev/null 2>&1); then
-            echo "    [APPLIED] $name"
-        else
-            echo "    [NOT APPLIED] $name"
-        fi
-    else
-        echo "    [SKIP] $name (package not found)"
-    fi
-done
+# ── Step 6: web profile plugins (optional) ───────────────────────────────────
+print_step "6/8" "Optional web-profile tooling (pnpm + dsh-web-mobile)"
 
-# ── Step 9: Runtime smoke test ───────────────────────────────────────────────
-echo "==> [9/9] Runtime smoke test..."
-if (cd "$DSH_DIR" && node -e "require('node-pty'); process.exit(0)" 2>/dev/null); then
-    echo "  node-pty: OK"
+DSH_HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
+WEB_PROFILE_DIR="$DSH_HOME_DIR/profiles/web"
+
+if cmd_exists pnpm; then
+    print_ok "pnpm present ($(command -v pnpm))"
 else
-    echo "  node-pty: LOAD FAILED (trying with --expose-internals)"
-    if (cd "$DSH_DIR" && node --expose-internals -e "require('node-pty'); process.exit(0)" 2>/dev/null); then
-        echo "  node-pty: OK (with --expose-internals)"
-    else
-        echo "  [WARN] node-pty fails to load even with --expose-internals"
-        echo "  This may affect the terminal plugin, but other features may work."
-    fi
+    print_info "Installing pnpm@11 (pure-JS; v12+ has no android-arm64 native binary)..."
+    if npm install -g pnpm@11 2>&1 | sed 's/^/    /'; then print_ok "pnpm@11 installed"; else print_warn "pnpm@11 install failed — plugin step will be skipped"; fi
 fi
 
-# koffi loads?
-if (cd "$DSH_DIR" && node -e "require('koffi'); process.exit(0)" 2>/dev/null); then
-    echo "  koffi: OK"
-else
-    echo "  [WARN] koffi fails to load — FFI features (file dialogs, etc.) may not work"
-fi
-
-# Sandbox smoke test: verify proot runner is active for Android
-echo "  bash sandbox:"
-if [ "$(uname -o)" = "Android" ] && command -v proot >/dev/null 2>&1; then
-    SANDBOX_TEST=$(node --expose-internals -e "
-const { LocalSandboxProvider } = require('$DSH_DIR/node_modules/@deepseek-ai/dsh-sandbox-local');
-console.log('loaded');
-" 2>&1)
-    if echo "$SANDBOX_TEST" | grep -q "loaded"; then
-        echo "    proot runner: registered"
+if [ -f "$WEB_PROFILE_DIR/package.json" ] && grep -q "dsh-mobile-nav" "$WEB_PROFILE_DIR/package.json" 2>/dev/null; then
+    print_ok "dsh-web-mobile already installed"
+elif cmd_exists pnpm; then
+    if node --expose-internals "$DSH_DIR/lib/bin.js" plugin --profile web add github:mexiaosqwq/dsh-web-mobile 2>&1 | sed 's/^/    /'; then
+        print_ok "dsh-web-mobile installed"
     else
-        echo "    proot runner: module load issue"
+        print_warn "dsh plugin add failed — install manually later:"
+        echo -e "  ${CYAN}node --expose-internals $DSH_DIR/lib/bin.js plugin --profile web add github:mexiaosqwq/dsh-web-mobile${RESET}"
     fi
 else
-    echo "    (non-Android or proot missing — skipped)"
+    print_warn "pnpm missing — skipping dsh-web-mobile"
 fi
 
-echo ""
-echo "==> Installation complete!"
-echo ""
+# ── Step 7: verification ─────────────────────────────────────────────────────
+print_step "7/8" "Verifying environment"
 
-# ── Make `dsh` usable directly (no manual alias needed) ─────────────────────
-# 1) Patch the installed bin.js shebang so npm's own `dsh` bin always runs
-#    with --expose-internals (required by HMR) — works in ANY shell, even
-#    inside scripts. Same trick the prebuilt (Plan B) packages use.
-DSH_BIN_JS="$DSH_DIR/lib/bin.js"
-if [ -f "$DSH_BIN_JS" ] && ! head -1 "$DSH_BIN_JS" | grep -q -- "--expose-internals"; then
-    NODE_BIN="$(command -v node)"
-    { printf '#!%s --expose-internals\n' "$NODE_BIN"; tail -n +2 "$DSH_BIN_JS"; } > "$DSH_BIN_JS.new"
-    mv "$DSH_BIN_JS.new" "$DSH_BIN_JS"
-    chmod +x "$DSH_BIN_JS"   # the .new rewrite drops +x under umask — restore it
-    echo "  [OK] patched $DSH_BIN_JS shebang (--expose-internals)"
-else
-    echo "  [OK] dsh bin.js shebang already has --expose-internals"
+print_ok "Node.js: ${CYAN}$(node -v 2>/dev/null || echo "not found")${RESET}"
+print_ok "dsh dir: ${CYAN}$DSH_DIR${RESET}"
+print_ok "dsh version: ${CYAN}$(node -p "require('$DSH_DIR/package.json').version" 2>/dev/null || echo unknown)${RESET}"
+
+print_subheader "Native modules"
+_NATIVE_MISSING=false
+if [ -f "$PTY_DIR/build/Release/pty.node" ]; then
+    print_ok "node-pty pty.node ${DIM}($(ls -lh "$PTY_DIR/build/Release/pty.node" | awk '{print $5}'))${RESET}"
+else print_error "node-pty pty.node ${DIM}(missing)${RESET}"; _NATIVE_MISSING=true; fi
+if [ -n "$KOFFI_OUT" ] && [ -f "$KOFFI_OUT" ]; then
+    print_ok "koffi koffi.node ${DIM}($(ls -lh "$KOFFI_OUT" | awk '{print $5}'))${RESET}"
+else print_error "koffi koffi.node ${DIM}(missing)${RESET}"; _NATIVE_MISSING=true; fi
+if $_NATIVE_MISSING; then
+    print_failure "Native modules are missing — the install is incomplete."
+    exit 1
 fi
 
-# 2) Belt-and-suspenders: append a `dsh` alias to the user's shell rc
-#    WITHOUT overwriting it (the shebang patch covers re-extracted bin.js
-#    cases; the alias covers every interactive shell). Creates the rc file
-#    if it does not exist yet, so the alias is always persisted.
-_DSH_ALIAS="alias dsh='node --expose-internals \$(npm root -g)/@deepseek-ai/dsh/lib/bin.js'"
+print_subheader "Patched modules"
+_check_patched() { # file, grep-needle, label
+    if [ -f "$1" ] && grep -q "$2" "$1" 2>/dev/null; then print_ok "$3"
+    else print_error "$3 ${DIM}(marker not found: $2)${RESET}"; _PATCH_MISSING=true; fi
+}
+_PATCH_MISSING=false
+_check_patched "$DSH_PKGS/dsh-fs-local/lib/index.js"                              "sepolicy denies link(2)" "fs-local: write/edit link->rename"
+_check_patched "$DSH_PKGS/dsh-session-persistence-jsonl/lib/index.js"             "Android sepolicy blocks link(2)" "session-persistence: link->rename"
+_check_patched "$DSH_PKGS/dsh-attachment-local/lib/index.js"                      "sepolicy denies link(2)" "attachment-local: link->rename"
+_check_patched "$DSH_PKGS/node-addon-system/lib/flock.js"                         "IS_ANDROID" "flock: no-op on android"
+_check_patched "$DSH_PKGS/dsh-subprocess-local/lib/index.js"                      "platform === \"android\"" "subprocess: android inspector"
+_check_patched "$DSH_PKGS/dsh-terminal-bash/lib/index.js"                         "files/usr/bin/bash" "terminal: Termux shell"
+_check_patched "$DSH_PKGS/dsh-sandbox-local/lib/index.js"                         "prootProfileArgs" "sandbox: proot runner"
+_check_patched "$DSH_PKGS/dsh-workspace/lib/index.js"                             "Termux: skip the sessionKnown" "workspace: archive fix"
+_check_patched "$DSH_DIR/node_modules/@vscode/ripgrep-android-arm64/package.json" "ripgrep-android-arm64" "ripgrep shim"
+if $_PATCH_MISSING; then
+    print_failure "Some patches are missing — re-run install.sh or bash fix-dsh-runtime.sh."
+    exit 1
+fi
+
+if (cd "$DSH_DIR" && node -e "require('sharp'); process.exit(0)" 2>/dev/null); then
+    print_ok "sharp: ${GREEN}OK${RESET} (wasm fallback) $(cd "$DSH_DIR" && node -e "const s=require('sharp');console.log(s.versions.sharp+' / vips '+s.versions.vips)")"
+else print_error "sharp does not load"; exit 1; fi
+
+# ── Step 8: final configuration ──────────────────────────────────────────────
+print_step "8/8" "Final configuration"
+
+print_subheader "Shell alias"
 _RC_FILE=""
-if [ -f "$HOME/.bashrc" ]; then
-    _RC_FILE="$HOME/.bashrc"
-elif [ -n "${SHELL:-}" ] && [ "${SHELL##*/}" = "zsh" ] && [ -f "$HOME/.zshrc" ]; then
-    _RC_FILE="$HOME/.zshrc"
-else
-    _RC_FILE="$HOME/.bashrc"
-    touch "$_RC_FILE"   # ensure the alias is actually persisted
-fi
+if [ -n "${SHELL:-}" ] && [ "${SHELL##*/}" = "zsh" ]; then _RC_FILE="$HOME/.zshrc"
+elif [ -n "${SHELL:-}" ] && [ "${SHELL##*/}" = "bash" ]; then _RC_FILE="$HOME/.bashrc"
+elif [ -f "$HOME/.zshrc" ]; then _RC_FILE="$HOME/.zshrc"
+else _RC_FILE="$HOME/.bashrc"; fi
+[ -f "$_RC_FILE" ] || touch "$_RC_FILE"
+print_ok "Shell config for alias: ${CYAN}$_RC_FILE${RESET} (shell=${SHELL:-unknown})"
+_DSH_ALIAS="alias dsh='node --expose-internals \$(npm root -g)/@deepseek-ai/dsh/lib/bin.js'"
 if grep -q "alias dsh=" "$_RC_FILE" 2>/dev/null; then
-    echo "  [SKIP] dsh alias already present in $_RC_FILE"
+    print_ok "dsh alias already present in $_RC_FILE"
 else
     echo "$_DSH_ALIAS" >> "$_RC_FILE"
-    echo "  [OK] Appended to $_RC_FILE:"
-    echo "    $_DSH_ALIAS"
-    echo "  [INFO] Run 'source $_RC_FILE' once (or open a new session) to activate,"
-    echo "  [INFO] then you can just type: dsh web"
+    print_ok "Appended to $_RC_FILE:"; echo -e "    ${CYAN}$_DSH_ALIAS${RESET}"
 fi
+
+print_subheader "Runtime smoke test"
+if (cd "$DSH_DIR" && node -e "require('node-pty'); process.exit(0)" 2>/dev/null); then
+    print_ok "node-pty: ${GREEN}OK${RESET}"
+else
+    if (cd "$DSH_DIR" && node --expose-internals -e "require('node-pty'); process.exit(0)" 2>/dev/null); then
+        print_ok "node-pty: ${GREEN}OK${RESET} ${DIM}(with --expose-internals)${RESET}"
+    else
+        print_warn "node-pty fails to load — terminal plugin may not work."
+    fi
+fi
+if (cd "$DSH_DIR" && node -e "require('koffi'); process.exit(0)" 2>/dev/null); then
+    print_ok "koffi: ${GREEN}OK${RESET}"; else print_warn "koffi fails to load — FFI features may not work"; fi
+
+print_subheader "Bash sandbox"
+if [ "$(uname -o)" = "Android" ] && cmd_exists proot; then
+    if node --expose-internals -e "require('$DSH_PKGS/dsh-sandbox-local'); console.log('loaded')" 2>/dev/null | grep -q loaded; then
+        print_ok "proot runner: ${GREEN}registered${RESET}"
+    else print_warn "proot runner: module load issue"; fi
+else
+    print_info "non-Android or proot missing — skipped"
+fi
+
 echo ""
-echo "  (Your existing shell config was never overwritten.)"
+print_success "Installation complete! 🎉"
 echo ""
-echo "Now run:  dsh web"
+echo -e "${BOLD}${WHITE}Quick start:${RESET}"
+echo -e "  ${GREEN}1.${RESET} ${DIM}Run:${RESET} ${CYAN}source $_RC_FILE${RESET} ${DIM}(or open a new terminal)${RESET}"
+echo -e "  ${GREEN}2.${RESET} ${DIM}Start the web UI:${RESET} ${CYAN}dsh web${RESET}"
+echo -e "  ${GREEN}3.${RESET} ${DIM}Open in browser:${RESET} ${CYAN}http://127.0.0.1:3080/${RESET}"
+echo ""
+echo -e "${DIM}After any \`npm install -g @deepseek-ai/dsh\` re-apply the fixes with:${RESET}"
+echo -e "  ${CYAN}bash $(basename "$REPO_DIR")/fix-dsh-runtime.sh${RESET}"
+echo ""
+echo -e "${DIM}─────────────────────────────────────────────────────────────────${RESET}"
+echo -e "${DIM}Installation log: ${CYAN}$NPM_LOG_FILE${RESET}"
+echo ""

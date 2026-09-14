@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 // dsh-termux postinstall (Plan B — precompiled native modules).
 //
-// Installs the patched @deepseek-ai/dsh globally WITHOUT compiling anything:
+// Installs a fully patched @deepseek-ai/dsh globally WITHOUT compiling
+// anything:
 //   1. npm install -g --ignore-scripts @deepseek-ai/dsh@<pinned>
-//   2. apply the Android source patches (bundled in patches/)
-//   3. drop in the prebuilt native modules (bundled in prebuilt/)
-//      - node-pty  -> node-pty/build/Release/pty.node
-//      - koffi     -> koffi/build/koffi/android_arm64/koffi.node
+//   2. drop in the prebuilt native modules (bundled in prebuilt/)
+//        - node-pty  -> node-pty/build/Release/pty.node
+//        - koffi     -> koffi/build/koffi/android_arm64/koffi.node
+//   3. apply every Termux fix by running the bundled canonical patcher
+//      scripts/apply-termux-fixes.mjs (same anchor-based set install.sh uses:
+//      sharp wasm fallback, link->rename for write/edit + sessions +
+//      attachments, flock no-op, platform checks, ripgrep shim, shebang).
 //
 // Everything is idempotent: re-running `npm i -g <tarball>` re-applies the
-// patches and re-drops the natives (npm re-extracts dsh first, which wipes
-// the previous copies).
+// fixes and re-drops the natives (npm re-extracts dsh first, which wipes the
+// previous copies).
 
 "use strict";
 
@@ -18,9 +22,10 @@ const { execSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
-// Bump together with patches/: only a dsh version whose sources the patches
-// apply to cleanly is safe to pin here. Overridable via DSH_VERSION.
-const DSH_VERSION = process.env.DSH_VERSION || "0.1.0-rc.6";
+// Only a dsh version whose anchors the bundled patcher knows is safe to pin
+// here. Bump together with scripts/apply-termux-fixes.mjs. Overridable via
+// DSH_VERSION.
+const DSH_VERSION = process.env.DSH_VERSION || "0.1.5-rc.2";
 const PKG_DIR = __dirname;
 
 function sh(cmd, opts) {
@@ -59,13 +64,9 @@ if (!globalRoot) {
   );
 }
 const dshDir = path.join(globalRoot, "@deepseek-ai", "dsh");
-const dshPkgs = path.join(dshDir, "node_modules", "@deepseek-ai");
 
 // ── Step 1: install dsh (download only, nothing compiles) ──────────────────
-// Try the user's configured registry first (respects .npmrc / mirrors the
-// user already set up), then fall back to the official registry and finally
-// npmmirror (China) — same multi-source strategy as install.sh.
-console.log(`==> [1/5] Installing @deepseek-ai/dsh@${DSH_VERSION} (no scripts — nothing compiles)`);
+console.log(`==> [1/3] Installing @deepseek-ai/dsh@${DSH_VERSION} (no scripts — nothing compiles)`);
 function installDsh(registry) {
   const flag = registry ? ` --registry="${registry}"` : "";
   execSync(`npm install -g --ignore-scripts @deepseek-ai/dsh@${DSH_VERSION}${flag}`, {
@@ -89,40 +90,8 @@ if (!dshInstalled) {
   process.exit(1);
 }
 
-// ── Step 2: apply the Android source patches ───────────────────────────────
-console.log("==> [2/3] Applying Android platform patches");
-const PATCH_TARGETS = [
-  ["01-terminal-bash-android-shell.patch", "dsh-terminal-bash"],
-  ["02-session-persistence-link-rename.patch", "dsh-session-persistence-jsonl"],
-  ["03-subprocess-local-android.patch", "dsh-subprocess-local"],
-  ["04-host-apiproxy-termux-open-index.patch", "dsh-host-apiproxy"],
-  ["04-host-apiproxy-termux-open-opener.patch", "dsh-host-apiproxy"],
-  ["05-host-directory-picker-native-android.patch", "dsh-host-directory-picker-native"],
-  ["06-workspace-archive-skip-session-known-check.patch", "dsh-workspace"],
-  ["07-sandbox-local-proot-runner.patch", "dsh-sandbox-local"],
-  ["koffi-statx.patch", null], // koffi lives outside the @deepseek-ai scope
-];
-for (const [file, pkg] of PATCH_TARGETS) {
-  const patch = path.join(PKG_DIR, "patches", file);
-  const dir = pkg ? path.join(dshPkgs, pkg) : path.join(dshDir, "node_modules", "koffi");
-  if (!fs.existsSync(patch)) {
-    console.log("  [WARN] patch file missing:", file);
-    continue;
-  }
-  if (!fs.existsSync(dir)) {
-    console.log("  [SKIP]", file, "(package dir not found)");
-    continue;
-  }
-  if (sh(`patch -p1 --dry-run --forward < "${patch}"`, { cwd: dir })) {
-    sh(`patch -p1 --forward < "${patch}"`, { cwd: dir });
-    console.log("  [OK]", file);
-  } else {
-    console.log("  [SKIP]", file, "(already applied or inapplicable)");
-  }
-}
-
-// ── Step 3: drop in the prebuilt native modules ─────────────────────────────
-console.log("==> [3/3] Installing prebuilt native modules (android-arm64)");
+// ── Step 2: drop in the prebuilt native modules ─────────────────────────────
+console.log("==> [2/3] Installing prebuilt native modules (android-arm64)");
 const prebuiltDir = path.join(PKG_DIR, "prebuilt", "android-arm64");
 const TARGETS = [
   ["pty.node", path.join(dshDir, "node_modules", "node-pty", "build", "Release", "pty.node")],
@@ -140,10 +109,9 @@ for (const [file, dest] of TARGETS) {
   console.log("  [OK]", file, "->", path.relative(globalRoot, dest));
 }
 
-// ── Step 3b: verify the natives actually load ───────────────────────────────
-// Catches an ABI/Node-version mismatch at install time with a clear message
-// instead of a confusing crash at first `dsh web`.
-console.log("==> [3b/5] Verifying native modules load...");
+// Verify the natives actually load before touching anything else: catches an
+// ABI/Node-version mismatch at install time with a clear message instead of a
+// confusing crash at first `dsh web`.
 const verify = sh(`node -e "require('${dshDir}/node_modules/node-pty'); require('${dshDir}/node_modules/koffi'); console.log('ok')"`);
 if (verify.includes("ok")) {
   console.log("  [OK] node-pty + koffi load");
@@ -154,47 +122,29 @@ if (verify.includes("ok")) {
   process.exit(1);
 }
 
-// ── Step 4: sharp WebAssembly fallback ──────────────────────────────────────
-// sharp's native (libvips) binary is not available for android-arm64; dsh's
-// attachment plugin fails to boot without it. The portable wasm build fixes it.
-console.log("==> [4/5] Installing sharp WebAssembly fallback...");
-let sharpOk = false;
-for (const registry of REGISTRY_FALLBACKS) {
-  try {
-    const flag = registry ? ` --registry="${registry}"` : "";
-    execSync(`npm install @img/sharp-wasm32${flag}`, { cwd: dshDir, stdio: "pipe", timeout: 300000 });
-    sharpOk = true;
-    break;
-  } catch {
-    // try next registry
-  }
+// ── Step 3: apply every Termux fix through the bundled canonical patcher ────
+// One patcher for install.sh, fix-dsh-runtime.sh and this postinstall, so the
+// three can never drift. It installs the sharp wasm fallback, patches
+// link(2)->rename(2) for write/edit + sessions + attachments, stubs flock,
+// fixes the android platform checks, adds the ripgrep shim and the
+// --expose-internals shebang.
+console.log("==> [3/3] Applying Termux runtime fixes");
+const patcher = path.join(PKG_DIR, "scripts", "apply-termux-fixes.mjs");
+if (!fs.existsSync(patcher)) {
+  console.error("  [ERROR] patcher not found in this package:", patcher);
+  console.error("          This tarball is stale — rebuild it with scripts/build-prebuilt.sh");
+  process.exit(1);
 }
-if (sharpOk) {
-  console.log("  [OK] @img/sharp-wasm32 installed");
-} else {
-  console.log("  [WARN] could not install @img/sharp-wasm32 (sharp may fail to load)");
-}
-
-// ── Step 5: make the `dsh` bin run with --expose-internals ─────────────────
-// The nested `npm install -g @deepseek-ai/dsh` links <prefix>/bin/dsh ->
-// @deepseek-ai/dsh/lib/bin.js. That file's shebang is a bare `node`, but the
-// HMR plugin needs --expose-internals, so we bake the flag into the shebang.
-// When the symlink is exec'd the kernel reads the target's shebang and passes
-// the flag — this is robust against npm re-linking bin entries. (We do NOT
-// declare bin.dsh in our own package.json: that would collide with
-// @deepseek-ai/dsh's bin during the nested install, EEXIST.)
-console.log("==> [5/5] Ensuring the dsh bin runs with --expose-internals");
-const binJs = path.join(dshDir, "lib", "bin.js");
-const shebang = `#!${process.execPath} --expose-internals`;
-const content = fs.readFileSync(binJs, "utf8");
-if (!content.startsWith("#!")) {
-  console.log("  [WARN] bin.js has no shebang — leaving as-is");
-} else if (content.startsWith(shebang)) {
-  console.log("  [OK] bin.js shebang already has --expose-internals");
-} else {
-  fs.writeFileSync(binJs, shebang + "\n" + content.slice(content.indexOf("\n") + 1));
-  fs.chmodSync(binJs, 0o755); // writeFileSync preserves mode; be explicit anyway
-  console.log("  [OK] bin.js shebang ->", shebang);
+try {
+  execSync(`node "${patcher}"`, {
+    stdio: "inherit",
+    env: { ...process.env, DSH_DIR: dshDir },
+    timeout: 900000,
+  });
+} catch {
+  console.error("  [ERROR] the Termux fix patcher failed — see the output above.");
+  console.error("          Fix that first; starting dsh web with missing patches will misbehave.");
+  process.exit(1);
 }
 
 // ── Summary ─────────────────────────────────────────────────────────────────

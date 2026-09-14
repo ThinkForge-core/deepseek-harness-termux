@@ -8,7 +8,7 @@ English | [简体中文](README.zh-CN.md)
 
 `deepseek-harness-termux` is a community-maintained compatibility layer that ports the official `@deepseek-ai/dsh` [agent harness](https://github.com/deepseek-ai/deepseek-harness) to Android environments running [Termux](https://termux.com/). The official npm package is built for glibc-based Linux distributions and depends on several native modules that fail to compile or misbehave on Android's Bionic libc. Instead of disabling plugins that depend on those modules, this repository patches the source code so every feature works on Termux.
 
-All required patches were generated automatically against the pristine upstream tarballs (`@deepseek-ai/dsh` `0.1.0-rc.6`) with `diff -u`, so they are exact and reproducible.
+Every fix is applied by a single anchor-based patch set — `scripts/apply-termux-fixes.mjs` — that runs against a clean upstream install. It is idempotent and **fails loudly** if upstream code moves, so a silent no-op is impossible. The ordered list of fixes lives in [`TERMUX-PATCHES.md`](TERMUX-PATCHES.md).
 
 ## Feature Status
 
@@ -24,6 +24,9 @@ Every plugin is enabled and working in the Termux build:
 | Bash Sandbox | ⚠️ Limited | `node-pty` works; `bubblewrap` is blocked by Android sepolicy at runtime and degrades safely (`SandboxUnavailableError`) |
 | Permission System | ✅ Working | Restored with `node-pty` |
 | Session Persistence | ✅ Fixed | `link(2)` → `rename(2)` fallback for Android sepolicy |
+| File tools (`write` / `edit`) | ✅ Fixed | `link(2)` → `rename(2)` in `dsh-fs-local` — without it every file write is denied by Android sepolicy |
+| File uploads / attachments | ✅ Fixed | `link(2)` → `rename(2)` / `copyFile()` in `dsh-attachment-local` |
+| Image processing | ✅ Working | real `sharp` + the official `@img/sharp-wasm32` fallback (no android-arm64 native binary exists, no stub needed) |
 | Bash Terminal (PTY) | ✅ Fixed | Default shell path resolved on Termux (`/usr/bin/bash`) |
 | Mobile UI Adaptation | ✅ Auto-installed | Narrow screens (<1024px): sidebar hidden, directory as drawer, full-width conversation; no effect on desktop |
 
@@ -70,7 +73,7 @@ and a `dsh` alias is auto-appended to `~/.bashrc` (created if missing, or
 ### How installation script work
 
 1. **Installs** `@deepseek-ai/dsh` globally.
-2. **Applies the Android source patches** under [`patches/`](patches/) to the installed packages.
+2. **Applies the Android runtime fixes** through `scripts/apply-termux-fixes.mjs` (idempotent, anchor-based — see [`TERMUX-PATCHES.md`](TERMUX-PATCHES.md)).
 3. **Builds the native addons** (`koffi`, `node-pty`) against the Termux bionic sysroot — the build environment (node headers, `GYP_DEFINES`, the `common.gypi` fix) is prepared and the source patches are applied **before** anything compiles.
 4. **Patches `koffi`** to drop the unsupported `statx()` syscall on Android (it does not exist in Bionic; falls back to POSIX `stat()`/`fstat()`).
 5. **Installs `@img/sharp-wasm32`** as a portable WebAssembly fallback for image processing (no native build needed).
@@ -179,18 +182,29 @@ Two ways to enable web search in the web UI:
 
 ## Patches
 
-| Patch | Package | What it fixes |
+All fixes are applied by `scripts/apply-termux-fixes.mjs` in a fixed order.
+Most are anchor-based text fixes inside the installed packages; the two large
+ones stay as `.patch` files:
+
+| Fix | Package | What it does |
 |---|---|---|
-| [`01-terminal-bash-android-shell.patch`](patches/01-terminal-bash-android-shell.patch) | `dsh-terminal-bash` | Resolves a real shell binary on Termux (no `/bin/bash` on Android) |
-| [`02-session-persistence-link-rename.patch`](patches/02-session-persistence-link-rename.patch) | `dsh-session-persistence-jsonl` | Falls back to atomic `rename(2)` when Android sepolicy blocks `link(2)` with `EACCES/EPERM` |
-| [`03-subprocess-local-android.patch`](patches/03-subprocess-local-android.patch) | `dsh-subprocess-local` | Treats `android` like `linux` for process-group inspection (`kill(-pid, 0)`) |
-| [`04-host-apiproxy-termux-open-index.patch`](patches/04-host-apiproxy-termux-open-index.patch) | `dsh-host-apiproxy` | Opens paths/URLs via `termux-open` on Android; enables native-path detection |
-| [`04-host-apiproxy-termux-open-opener.patch`](patches/04-host-apiproxy-termux-open-opener.patch) | `dsh-host-apiproxy` | Same fixes in `lib/types/native-path-opener.js` |
-| [`05-host-directory-picker-native-android.patch`](patches/05-host-directory-picker-native-android.patch) | `dsh-host-directory-picker-native` | Routes directory picking through the Linux (zenity) path on Android |
-| [`06-workspace-archive-skip-session-known-check.patch`](patches/06-workspace-archive-skip-session-known-check.patch) | `dsh-workspace` | Skips the session-known integrity check when archiving (fails on fresh installs) |
-| [`07-sandbox-local-proot-runner.patch`](patches/07-sandbox-local-proot-runner.patch) | `dsh-sandbox-local` | Uses `proot` as the sandbox runner on Termux (no bubblewrap namespace support) |
-| [`08-dsh-tool-fs-search-android-rg.patch`](patches/08-dsh-tool-fs-search-android-rg.patch) | `dsh-tool-fs-search` | Resolves ripgrep via `require.resolve()` + system-rg fallback; `@vscode/ripgrep` ships no `android-arm64` platform package (see [`docs/termux-ripgrep-fix.md`](docs/termux-ripgrep-fix.md)) |
-| [`koffi-statx.patch`](patches/koffi-statx.patch) | `koffi` | Conditionally compiles out the `statx()` syscall on Android |
+| sharp | `sharp` + `@img/sharp-wasm32` | Installs the official WebAssembly fallback so image processing works with no native android-arm64 build |
+| fs-local | `dsh-fs-local` | `link(2)` → `rename(2)` fallback: makes the `write`/`edit` file tools work |
+| session-persistence | `dsh-session-persistence-jsonl` | `link(2)` → `rename(2)` fallback for session files (3 call sites, incl. the worker) |
+| attachment-local | `dsh-attachment-local` | `link(2)` → `rename(2)`/`copyFile()` for uploads and immutable aliases |
+| flock | `node-addon-system` | `flock(2)` no-op on Android (Bionic has no such syscall) |
+| subprocess-local | `dsh-subprocess-local` | Treats `android` like `linux` for process-group inspection |
+| terminal-bash | `dsh-terminal-bash` | Resolves a shell binary that really exists on Termux |
+| sandbox-local | `dsh-sandbox-local` | Uses `proot` as the sandbox runner ([patch](patches/07-sandbox-local-proot-runner.patch)) |
+| native-command | `dsh-native-command` | Opens paths/URLs via `termux-open` on Android |
+| directory-picker | `dsh-host-directory-picker-native` | Routes directory picking through the zenity path on Android |
+| workspace | `dsh-workspace` | Skips the session-known check when archiving |
+| ripgrep | `@vscode/ripgrep-android-arm64` (shim) | Resolves to the system `rg`; `@vscode/ripgrep` ships no android package (see [`docs/termux-ripgrep-fix.md`](docs/termux-ripgrep-fix.md)) |
+| bin.js | `@deepseek-ai/dsh` | `--expose-internals` shebang |
+| koffi | `koffi` | Conditionally compiles out `statx()` on Android ([patch](patches/koffi-statx.patch)) |
+
+`install.sh` runs this set automatically; after `npm install -g @deepseek-ai/dsh`
+re-apply it with `bash fix-dsh-runtime.sh`.
 
 ## Compatibility Notes
 
@@ -202,24 +216,20 @@ Two ways to enable web search in the web UI:
 
 ```
 deepseek-harness-termux/
-├── README.md                  # This file (English)
-├── README.zh-CN.md            # 简体中文 README
-├── LICENSE                    # MIT License
-├── install.sh                 # Automated installer (idempotent)
+├── README.md                      # This file (English)
+├── README.zh-CN.md                # 简体中文 README
+├── TERMUX-PATCHES.md              # The ordered Termux fix set (canonical reference)
+├── LICENSE                        # MIT License
+├── install.sh                     # Clean from-scratch installer (idempotent)
+├── fix-dsh-runtime.sh             # Re-apply all fixes after an upgrade
 ├── docs/
-│   └── termux-ripgrep-fix.md  # Ripgrep android-arm64 fix (root cause + recovery)
+│   └── termux-ripgrep-fix.md      # Ripgrep android-arm64 fix (root cause + recovery)
 ├── scripts/
-│   └── fix-dsh-glob-rg.sh     # Re-apply the ripgrep fix after `npm update -g`
-└── patches/                   # Source patches (patch -p1 inside each package)
-    ├── 01-terminal-bash-android-shell.patch
-    ├── 02-session-persistence-link-rename.patch
-    ├── 03-subprocess-local-android.patch
-    ├── 04-host-apiproxy-termux-open-index.patch
-    ├── 04-host-apiproxy-termux-open-opener.patch
-    ├── 05-host-directory-picker-native-android.patch
-    ├── 06-workspace-archive-skip-session-known-check.patch
+│   ├── apply-termux-fixes.mjs     # The patch set itself (idempotent, anchor-based)
+│   ├── fix-npm.sh                 # Recovery: clean reinstall of node/npm
+│   └── build-prebuilt.sh          # Optional prebuilt tarball builder
+└── patches/                       # Large patches applied by the patcher / installer
     ├── 07-sandbox-local-proot-runner.patch
-    ├── 08-dsh-tool-fs-search-android-rg.patch
     └── koffi-statx.patch
 ```
 

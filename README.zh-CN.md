@@ -8,7 +8,7 @@
 
 `deepseek-harness-termux` 是一个社区维护的兼容层,将官方 [`@deepseek-ai/dsh`](https://github.com/deepseek-ai/deepseek-harness) 智能体框架移植到基于 [Termux](https://termux.com/) 的 Android 环境。官方 npm 包面向 glibc 系的 Linux 发行版构建,依赖的原生模块在 Android 的 Bionic libc 上要么编译失败、要么行为异常。本项目做法是直接修改关键源码以适配原生 Android 层,而不是禁用依赖这些模块的插件,让每个功能在 Termux 上都真实可用。
 
-所有补丁均由干净的官方 tarball(`@deepseek-ai/dsh` `0.1.0-rc.6)`通过 `diff -u` 自动生成,精确、可复现。
+所有修复由单一的、基于锚点的补丁集合 —— `scripts/apply-termux-fixes.mjs` —— 应用于干净的上游安装。它可重复执行，且当上游代码变动时**直接报错**，绝不会静默失效。修复的有序清单见 [`TERMUX-PATCHES.md`](TERMUX-PATCHES.md)。
 
 ## 功能状态
 
@@ -24,6 +24,9 @@ Termux 构建中所有插件均启用并可用:
 | Bash 沙箱 | ⚠️ 有限 | `node-pty` 正常;`bubblewrap` 在运行时被 Android sepolicy 拦截,安全降级为 `SandboxUnavailableError`,不崩溃 |
 | 权限系统 (Permission) | ✅ 正常 | 随 `node-pty` 一并恢复 |
 | 会话持久化 | ✅ 已修复 | Android sepolicy 下 `link(2)` 回退为 `rename(2)` |
+| 文件工具 (`write` / `edit`) | ✅ 已修复 | `dsh-fs-local` 中 `link(2)` → `rename(2)` —— 否则每次写文件都会被 Android sepolicy 拒绝 |
+| 文件上传 / 附件 | ✅ 已修复 | `dsh-attachment-local` 中 `link(2)` → `rename(2)` / `copyFile()` |
+| 图像处理 | ✅ 正常 | 真实 `sharp` + 官方 `@img/sharp-wasm32` 回退（无 android-arm64 原生二进制，但无需 stub） |
 | Bash 终端 (PTY) | ✅ 已修复 | 在 Termux 上正确解析默认 shell 路径(`/usr/bin/bash`) |
 | 移动端 UI 适配 | ✅ 自动安装 | 窄屏(<1024px)隐藏侧栏、目录变抽屉、会话全宽;宽屏无影响 |
 
@@ -68,7 +71,7 @@ bash install.sh
 ### 安装脚本原理
 
 1. **全局安装** `@deepseek-ai/dsh`。
-2. **应用 [`patches/`](patches/) 下的 Android 源码补丁**到已安装的各个包。
+2. **应用 Android 运行时修复**（`scripts/apply-termux-fixes.mjs`，幂等、基于锚点 —— 见 [`TERMUX-PATCHES.md`](TERMUX-PATCHES.md)）。
 3. **编译原生模块** (`koffi`、`node-pty`):基于 Termux bionic 环境编译——编译**之前**先准备好构建环境(node 头文件、`GYP_DEFINES`、`common.gypi` 修复)并应用源码补丁。
 4. **修补 `koffi`**:在 Android 上剔除不支持的 `statx()` 系统调用(Bionic 中不存在,回退到 POSIX `stat()`/`fstat()`)。
 5. **安装 `@img/sharp-wasm32`** 作为图像处理的可移植 WebAssembly 回退方案(无需原生编译)。
@@ -163,15 +166,26 @@ Web UI 里有两种开启网页搜索的方式:
 
 ## 源码补丁
 
-| 补丁 | 目标包 | 修复内容 |
+所有修改由 `scripts/apply-termux-fixes.mjs` 按固定顺序应用。多数是基于锚点的就地修改；两个较大的补丁以 `.patch` 文件形式保留：
+
+| 修复 | 目标包 | 说明 |
 |---|---|---|
-| [`01-terminal-bash-android-shell.patch`](patches/01-terminal-bash-android-shell.patch) | `dsh-terminal-bash` | 在 Termux 上解析真实存在的 shell(Android 没有 `/bin/bash`) |
-| [`02-session-persistence-link-rename.patch`](patches/02-session-persistence-link-rename.patch) | `dsh-session-persistence-jsonl` | Android sepolicy 拒绝 `link(2)`(`EACCES/EPERM`)时回退为原子 `rename(2)` |
-| [`03-subprocess-local-android.patch`](patches/03-subprocess-local-android.patch) | `dsh-subprocess-local` | 进程组检查(`kill(-pid, 0)`)将 `android` 视同 `linux` |
-| [`04-host-apiproxy-termux-open-index.patch`](patches/04-host-apiproxy-termux-open-index.patch) | `dsh-host-apiproxy` | Android 下用 `termux-open` 打开路径/URL;启用原生路径检测 |
-| [`04-host-apiproxy-termux-open-opener.patch`](patches/04-host-apiproxy-termux-open-opener.patch) | `dsh-host-apiproxy` | `lib/types/native-path-opener.js` 中的同类修复 |
-| [`05-host-directory-picker-native-android.patch`](patches/05-host-directory-picker-native-android.patch) | `dsh-host-directory-picker-native` | Android 下目录选择走 Linux(zenity)路径 |
-| [`koffi-statx.patch`](patches/koffi-statx.patch) | `koffi` | 在 Android 上有条件地编译掉 `statx()` 系统调用 |
+| sharp | `sharp` + `@img/sharp-wasm32` | 安装官方 WebAssembly 回退，无需原生 android-arm64 构建即可处理图片 |
+| fs-local | `dsh-fs-local` | `link(2)` → `rename(2)` 回退：让 `write`/`edit` 文件工具可用 |
+| session-persistence | `dsh-session-persistence-jsonl` | 会话文件 `link(2)` → `rename(2)` 回退（3 处，含 worker） |
+| attachment-local | `dsh-attachment-local` | 上传与不可变别名 `link(2)` → `rename(2)`/`copyFile()` |
+| flock | `node-addon-system` | Android 上 `flock(2)` 直接 no-op（Bionic 无此系统调用） |
+| subprocess-local | `dsh-subprocess-local` | 进程组检查将 `android` 视同 `linux` |
+| terminal-bash | `dsh-terminal-bash` | 解析 Termux 上真实存在的 shell |
+| sandbox-local | `dsh-sandbox-local` | 使用 `proot` 作为沙箱执行器（[patch](patches/07-sandbox-local-proot-runner.patch)） |
+| native-command | `dsh-native-command` | Android 下用 `termux-open` 打开路径/URL |
+| directory-picker | `dsh-host-directory-picker-native` | Android 下目录选择走 zenity 路径 |
+| workspace | `dsh-workspace` | 归档时跳过 session-known 检查 |
+| ripgrep | `@vscode/ripgrep-android-arm64`（shim） | 解析到系统 `rg`；`@vscode/ripgrep` 无 android 平台包（见 [`docs/termux-ripgrep-fix.md`](docs/termux-ripgrep-fix.md)） |
+| bin.js | `@deepseek-ai/dsh` | `--expose-internals` shebang |
+| koffi | `koffi` | Android 上条件编译掉 `statx()`（[patch](patches/koffi-statx.patch)） |
+
+`install.sh` 会自动执行该集合；每次 `npm install -g @deepseek-ai/dsh` 之后用 `bash fix-dsh-runtime.sh` 重新应用。
 
 ## 兼容性说明
 
@@ -183,17 +197,20 @@ Web UI 里有两种开启网页搜索的方式:
 
 ```
 deepseek-harness-termux/
-├── README.md                  # 本文件(英文)
-├── README.zh-CN.md            # 简体中文 README
-├── LICENSE                    # MIT 许可证
-├── install.sh                 # 自动化安装脚本(幂等)
-└── patches/                   # 源码补丁(在各包目录内 patch -p1 应用)
-    ├── 01-terminal-bash-android-shell.patch
-    ├── 02-session-persistence-link-rename.patch
-    ├── 03-subprocess-local-android.patch
-    ├── 04-host-apiproxy-termux-open-index.patch
-    ├── 04-host-apiproxy-termux-open-opener.patch
-    ├── 05-host-directory-picker-native-android.patch
+├── README.md                      # 英文 README
+├── README.zh-CN.md                # 本文件（简体中文）
+├── TERMUX-PATCHES.md              # 有序的 Termux 修复集合（权威参考）
+├── LICENSE                        # MIT 许可证
+├── install.sh                     # 从零开始的干净安装脚本（幂等）
+├── fix-dsh-runtime.sh             # 升级后重新应用全部修复
+├── docs/
+│   └── termux-ripgrep-fix.md      # ripgrep android-arm64 修复（根因与恢复）
+├── scripts/
+│   ├── apply-termux-fixes.mjs     # 补丁集合本体（幂等、基于锚点）
+│   ├── fix-npm.sh                 # 恢复工具：干净重装 node/npm
+│   └── build-prebuilt.sh          # 可选的预编译包构建脚本
+└── patches/                       # 由补丁器/安装脚本应用的大补丁
+    ├── 07-sandbox-local-proot-runner.patch
     └── koffi-statx.patch
 ```
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-termux",
-  "version": "0.1.0-termux.1",
+  "version": "0.1.5-termux.1",
   "description": "Precompiled Termux deployment of @deepseek-ai/dsh (Plan B) — installs the patched dsh with prebuilt native modules (node-pty, koffi) for android-arm64. No compilation, NDK, or cmake required.",
   "license": "MIT",
   "type": "commonjs",
@@ -14,7 +14,9 @@
     "bin",
     "install.js",
     "patches",
+    "scripts",
     "prebuilt",
+    "TERMUX-PATCHES.md",
     "README.md",
     "README.zh-CN.md"
   ],

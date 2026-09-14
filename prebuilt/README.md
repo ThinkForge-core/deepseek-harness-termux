@@ -33,23 +33,24 @@ dsh web
 ```
 
 A postinstall fetches `@deepseek-ai/dsh` from the npm registry (with
-npmjs→npmmirror fallback), applies the bundled patches, and drops in the
-prebuilt natives. Small artifact; needs the registry at install time. Choose
-this only when the ~57 MB download matters.
+npmjs→npmmirror fallback), drops in the prebuilt natives, and applies every
+Termux fix with the bundled canonical patcher (`scripts/apply-termux-fixes.mjs` —
+the same one `install.sh` uses). Small artifact; needs the registry at install
+time. Choose this only when the ~57 MB download matters.
 
 ## What the postinstall does (layered variant)
 
 1. `npm install -g --ignore-scripts @deepseek-ai/dsh@<pinned version>` (nothing compiles)
-2. Applies the Android source patches bundled in `patches/`
-3. Drops in the prebuilt natives:
+2. Drops in the prebuilt natives:
    - `node-pty/build/Release/pty.node`
    - `koffi/build/koffi/android_arm64/koffi.node`
-4. Installs `@img/sharp-wasm32` (sharp's portable WebAssembly fallback —
-   required for the attachment plugin to boot on android-arm64)
-5. Patches `dsh/lib/bin.js`'s shebang so the `dsh` bin always runs with
-   `--expose-internals` (required by the HMR plugin)
+3. Runs the bundled canonical patcher `scripts/apply-termux-fixes.mjs`, which
+   applies the whole ordered fix set: the `@img/sharp-wasm32` fallback,
+   `link(2)`→`rename(2)` for the write/edit tools + sessions + attachments, the
+   `flock` no-op, the `android` platform checks, the ripgrep shim and the
+   `--expose-internals` shebang (see [`../TERMUX-PATCHES.md`](../TERMUX-PATCHES.md)).
 
-Everything is idempotent — re-running the install re-applies patches and
+Everything is idempotent — re-running the install re-applies the fixes and
 natives (npm re-extracts `dsh` first).
 
 ## Requirements
@@ -57,8 +58,8 @@ natives (npm re-extracts `dsh` first).
 - Termux on **arm64** (aarch64) — this package ships android-arm64 binaries
   only
 - Node.js `>= 22.19` (the same requirement as `@deepseek-ai/dsh`)
-- `patch` (`pkg install patch`) — used by the layered variant to apply the
-  source patches
+- `patch` (`pkg install patch`) — used by the layered variant for the proot fix
+- `ripgrep` (`pkg install ripgrep`) — the ripgrep shim points at the system `rg`
 
 ## Rebuilding the prebuilt packages (for maintainers)
 

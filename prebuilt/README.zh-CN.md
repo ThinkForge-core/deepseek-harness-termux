@@ -31,26 +31,29 @@ dsh web
 ```
 
 postinstall 从 npm registry 拉取 `@deepseek-ai/dsh`(npmjs→npmmirror 自动回退)、
-应用内置补丁、放入预编译原生模块。产物小;安装时需要联网。仅当在意 ~57MB
+放入预编译原生模块,并用内置的权威补丁器(`scripts/apply-termux-fixes.mjs`,
+与 `install.sh` 完全同一套)应用全部 Termux 修复。产物小;安装时需要联网。仅当在意 ~57MB
 下载体积时选择此模式。
 
 ## postinstall 做的事(精简模式)
 
 1. `npm install -g --ignore-scripts @deepseek-ai/dsh@<固定版本>`(只下载,不编译;registry 失败会自动回退 npmjs → npmmirror)
-2. 应用 `patches/` 里的 Android 源码补丁
-3. 放入预编译原生模块:
+2. 放入预编译原生模块:
    - `node-pty/build/Release/pty.node`
    - `koffi/build/koffi/android_arm64/koffi.node`
-4. 安装 `@img/sharp-wasm32`(sharp 的 WebAssembly 回退——attachment 插件在 android-arm64 上启动必需)
-5. 修改 `dsh/lib/bin.js` 的 shebang,让 `dsh` 命令自动带上 `--expose-internals`(HMR 插件需要)
+3. 运行内置的权威补丁器 `scripts/apply-termux-fixes.mjs`,按顺序应用整套修复:
+   `@img/sharp-wasm32` 回退、write/edit 与会话/附件的 `link(2)`→`rename(2)`、
+   `flock` no-op、`android` 平台判定、ripgrep shim、`--expose-internals` shebang
+   (见 [`../TERMUX-PATCHES.md`](../TERMUX-PATCHES.md))。
 
-整个流程幂等——重复安装会重新应用补丁并重新放置原生模块(npm 会先重新解包 `dsh`)。
+整个流程幂等——重复安装会重新应用修复并重新放置原生模块(npm 会先重新解包 `dsh`)。
 
 ## 环境要求
 
 - **arm64(aarch64)** 的 Termux——本包只提供 android-arm64 二进制
 - Node.js `>= 22.19`(与 `@deepseek-ai/dsh` 要求一致)
-- `patch`(`pkg install patch`)——精简模式应用源码补丁时需要
+- `patch`(`pkg install patch`)——精简模式应用 proot 补丁时需要
+- `ripgrep`(`pkg install ripgrep`)——ripgrep shim 指向系统 `rg`
 
 ## 维护者:重建预编译包
 
