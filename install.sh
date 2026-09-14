@@ -2,10 +2,12 @@
 # install.sh — fully automated install of @deepseek-ai/dsh on Android/Termux.
 #
 # Usage:
-#   bash install.sh [VERSION]     # VERSION default: latest
+#   bash install.sh [VERSION]     # VERSION default: the validated pin below
+#                                 # (pass `latest` to opt into npm's latest tag)
 #
-# The script is designed to run against a CLEAN kernel: it installs dsh from
-# npm and then applies every Termux fix through scripts/apply-termux-fixes.mjs
+# The script is designed to run against a CLEAN dsh install — an unmodified
+# `npm install -g @deepseek-ai/dsh` tree with no manual patching: it installs dsh
+# and then applies every Termux fix through scripts/apply-termux-fixes.mjs
 # (idempotent, anchor-based, fails loudly if upstream code moved). Re-running it
 # is always safe and repairs a tree that an `npm install -g` has overwritten.
 #
@@ -43,8 +45,13 @@ print_subitem()   { echo -e "${MAGENTA}│${RESET}  $1"; }
 print_subfooter() { echo -e "${MAGENTA}└─────────────────────────────────────────────────────────────${RESET}"; }
 
 # ── Version selection ────────────────────────────────────────────────────────
-TARGET_VERSION="${1:-latest}"
-if [ "$TARGET_VERSION" = "latest" ]; then VERSION_DISPLAY="latest"; else VERSION_DISPLAY="v$TARGET_VERSION"; fi
+# The patcher matches upstream code by exact anchors, so the default is a pin
+# that has been validated end-to-end rather than a moving tag. Note that npm's
+# `latest` tag currently points at an OLDER prerelease (0.1.5-rc.1) than the
+# newest published one (0.1.5-rc.2 = `next`), so `latest` is not the newest.
+readonly VALIDATED_DSH_VERSION="0.1.5-rc.2"
+TARGET_VERSION="${1:-$VALIDATED_DSH_VERSION}"
+if [ "$TARGET_VERSION" = "latest" ]; then VERSION_DISPLAY="latest (unpinned)"; else VERSION_DISPLAY="v$TARGET_VERSION"; fi
 
 print_header "🚀 DeepSeek DSH Installer for Android/Termux"
 echo -e "${BOLD}Target version:${RESET} ${GREEN}$VERSION_DISPLAY${RESET}"
@@ -248,8 +255,36 @@ if ! $DSH_INSTALL_OK; then
     echo -e "  Try manually: ${CYAN}npm install -g $PKG_SPEC${RESET}"; exit 1
 fi
 
-DSH_PKGS="$DSH_DIR/node_modules/@deepseek-ai"
 print_ok "Package installed at: ${CYAN}$DSH_DIR${RESET}"
+
+# ── package lookup ──────────────────────────────────────────────────────────
+# A plain `npm install -g` HOISTS dsh's dependencies to <prefix>/lib/node_modules,
+# while the vendored/prebuilt layout NESTS them in <dsh>/node_modules. Resolve
+# every package by walking node_modules upwards from the dsh root, exactly like
+# Node's own resolver, so both layouts work.
+resolve_pkg_dir() {
+    local name="$1" dir="$DSH_DIR" up
+    while :; do
+        if [ -d "$dir/node_modules/$name" ]; then printf '%s\n' "$dir/node_modules/$name"; return 0; fi
+        up="$(dirname "$dir")"
+        [ "$up" = "$dir" ] && return 0
+        dir="$up"
+    done
+}
+
+# node_modules root that <name> was resolved from — siblings live here.
+pkg_nm_root() {
+    local d; d="$(resolve_pkg_dir "$1")"
+    [ -n "$d" ] || return 0
+    dirname "$(dirname "$d")"
+}
+
+# Path of an @deepseek-ai/<name> package, or of a file inside it.
+pkg_file() {
+    local dir; dir="$(resolve_pkg_dir "@deepseek-ai/$1")"
+    [ -n "$dir" ] || dir="$DSH_DIR/node_modules/@deepseek-ai/$1"
+    if [ -n "${2:-}" ]; then printf '%s\n' "$dir/$2"; else printf '%s\n' "$dir"; fi
+}
 
 # ── Step 4: build native addons ──────────────────────────────────────────────
 print_step "4/8" "Building native addons"
@@ -257,7 +292,10 @@ print_step "4/8" "Building native addons"
 NODE_GYP_BIN="$(dirname "$(dirname "$(command -v npm)")")/lib/node_modules/npm/bin/node-gyp-bin"
 [ -d "$NODE_GYP_BIN" ] && export PATH="$NODE_GYP_BIN:$PATH"
 
-KOFFI_DIR="$DSH_DIR/node_modules/koffi"
+KOFFI_DIR="$(resolve_pkg_dir koffi)"
+PTY_DIR="$(resolve_pkg_dir node-pty)"
+if [ -z "$KOFFI_DIR" ]; then print_error "koffi package not found next to $DSH_DIR"; exit 1; fi
+if [ -z "$PTY_DIR" ]; then print_error "node-pty package not found next to $DSH_DIR"; exit 1; fi
 KOFFI_CANONICAL="$KOFFI_DIR/build/koffi/android_arm64/koffi.node"
 KOFFI_BUILD=false
 
@@ -290,7 +328,6 @@ if $KOFFI_BUILD; then
 fi
 KOFFI_OUT="$(find_koffi_node "$KOFFI_DIR")"; [ -n "$KOFFI_OUT" ] || KOFFI_OUT="$KOFFI_CANONICAL"
 
-PTY_DIR="$DSH_DIR/node_modules/node-pty"
 print_subheader "Building node-pty"
 if [ -f "$PTY_DIR/build/Release/pty.node" ]; then
     print_ok "pty.node already built."
@@ -309,7 +346,7 @@ else
     fi
 fi
 
-SUB_DIR="$DSH_PKGS/dsh-subprocess-local"
+SUB_DIR="$(pkg_file dsh-subprocess-local)"
 if [ -f "$SUB_DIR/scripts/ensure-spawn-helper.mjs" ]; then
     (cd "$SUB_DIR" && node scripts/ensure-spawn-helper.mjs 2>&1 | sed 's/^/    /') && \
         print_ok "subprocess spawn-helper restored (chmod 755)"
@@ -381,15 +418,15 @@ _check_patched() { # file, grep-needle, label
     else print_error "$3 ${DIM}(marker not found: $2)${RESET}"; _PATCH_MISSING=true; fi
 }
 _PATCH_MISSING=false
-_check_patched "$DSH_PKGS/dsh-fs-local/lib/index.js"                              "sepolicy denies link(2)" "fs-local: write/edit link->rename"
-_check_patched "$DSH_PKGS/dsh-session-persistence-jsonl/lib/index.js"             "Android sepolicy blocks link(2)" "session-persistence: link->rename"
-_check_patched "$DSH_PKGS/dsh-attachment-local/lib/index.js"                      "sepolicy denies link(2)" "attachment-local: link->rename"
-_check_patched "$DSH_PKGS/node-addon-system/lib/flock.js"                         "IS_ANDROID" "flock: no-op on android"
-_check_patched "$DSH_PKGS/dsh-subprocess-local/lib/index.js"                      "platform === \"android\"" "subprocess: android inspector"
-_check_patched "$DSH_PKGS/dsh-terminal-bash/lib/index.js"                         "files/usr/bin/bash" "terminal: Termux shell"
-_check_patched "$DSH_PKGS/dsh-sandbox-local/lib/index.js"                         "prootProfileArgs" "sandbox: proot runner"
-_check_patched "$DSH_PKGS/dsh-workspace/lib/index.js"                             "Termux: skip the sessionKnown" "workspace: archive fix"
-_check_patched "$DSH_DIR/node_modules/@vscode/ripgrep-android-arm64/package.json" "ripgrep-android-arm64" "ripgrep shim"
+_check_patched "$(pkg_file dsh-fs-local lib/index.js)"                              "sepolicy denies link(2)" "fs-local: write/edit link->rename"
+_check_patched "$(pkg_file dsh-session-persistence-jsonl lib/index.js)"             "Android sepolicy blocks link(2)" "session-persistence: link->rename"
+_check_patched "$(pkg_file dsh-attachment-local lib/index.js)"                      "sepolicy denies link(2)" "attachment-local: link->rename"
+_check_patched "$(pkg_file node-addon-system lib/flock.js)"                         "IS_ANDROID" "flock: no-op on android"
+_check_patched "$(pkg_file dsh-subprocess-local lib/index.js)"                      "platform === \"android\"" "subprocess: android inspector"
+_check_patched "$(pkg_file dsh-terminal-bash lib/index.js)"                         "files/usr/bin/bash" "terminal: Termux shell"
+_check_patched "$(pkg_file dsh-sandbox-local lib/index.js)"                         "prootProfileArgs" "sandbox: proot runner"
+_check_patched "$(pkg_file dsh-workspace lib/index.js)"                             "Termux: skip the sessionKnown" "workspace: archive fix"
+_check_patched "$(pkg_nm_root '@vscode/ripgrep')/@vscode/ripgrep-android-arm64/package.json" "ripgrep-android-arm64" "ripgrep shim"
 if $_PATCH_MISSING; then
     print_failure "Some patches are missing — re-run install.sh or bash fix-dsh-runtime.sh."
     exit 1
@@ -433,7 +470,7 @@ if (cd "$DSH_DIR" && node -e "require('koffi'); process.exit(0)" 2>/dev/null); t
 
 print_subheader "Bash sandbox"
 if [ "$(uname -o)" = "Android" ] && cmd_exists proot; then
-    if node --expose-internals -e "require('$DSH_PKGS/dsh-sandbox-local'); console.log('loaded')" 2>/dev/null | grep -q loaded; then
+    if node --expose-internals -e "require('$(pkg_file dsh-sandbox-local)'); console.log('loaded')" 2>/dev/null | grep -q loaded; then
         print_ok "proot runner: ${GREEN}registered${RESET}"
     else print_warn "proot runner: module load issue"; fi
 else

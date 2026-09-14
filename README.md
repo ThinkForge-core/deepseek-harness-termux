@@ -6,6 +6,15 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
+> [!NOTE]
+> **This is a fork of [Vengisk/deepseek-harness-termux](https://github.com/Vengisk/deepseek-harness-termux).**
+> The original project is credited below; all clone and install commands on this
+> page point at **this** fork, so you get the patch pipeline documented here.
+> `upstream` is wired to the original repository, so `git fetch upstream && git
+> merge upstream/main` pulls its changes in.
+
+---
+
 `deepseek-harness-termux` is a community-maintained compatibility layer that ports the official `@deepseek-ai/dsh` [agent harness](https://github.com/deepseek-ai/deepseek-harness) to Android environments running [Termux](https://termux.com/). The official npm package is built for glibc-based Linux distributions and depends on several native modules that fail to compile or misbehave on Android's Bionic libc. Instead of disabling plugins that depend on those modules, this repository patches the source code so every feature works on Termux.
 
 Every fix is applied by a single anchor-based patch set — `scripts/apply-termux-fixes.mjs` — that runs against a clean upstream install. It is idempotent and **fails loudly** if upstream code moves, so a silent no-op is impossible. The ordered list of fixes lives in [`TERMUX-PATCHES.md`](TERMUX-PATCHES.md).
@@ -47,6 +56,20 @@ Every plugin is enabled and working in the Termux build:
 
 ## Installation
 
+> [!IMPORTANT]
+> **Supported dsh version: `0.1.5-rc.2` (default).** The patcher matches upstream
+> code by exact anchors, so the patch set is validated against one release and
+> installed explicitly rather than through a moving tag — that is what the
+> default pin is for.
+>
+> Note that npm's `latest` tag is currently `0.1.5-rc.1` while the newest
+> published prerelease is `0.1.5-rc.2` (tagged `next`): **`latest` is not the
+> newest**. The pin is a reproducibility choice, not a workaround — a clean-room
+> run applied the complete patch set to **both** rc.1 and rc.2 with zero missing
+> and zero failed fixes. If you pass a different version and upstream moved the
+> code, the patcher **fails loudly** rather than producing a half-patched
+> install.
+
 Two deployment options:
 
 ### Plan A — compile on device (install.sh)
@@ -55,12 +78,16 @@ Full control, works on any arm64 Termux; compiles `node-pty`/`koffi` once
 (clang + cmake + NDK sysroot needed, ~5–10 min):
 
 ```bash
-# Clone this repository
-git clone https://github.com/Vengisk/deepseek-harness-termux.git
+# Clone this fork
+git clone https://github.com/ThinkForge-core/deepseek-harness-termux.git
 cd deepseek-harness-termux
 
 # Run the automated installer (installs dsh, applies patches, builds node-pty)
 bash install.sh
+
+# ...or choose explicitly: another pinned version, or the unpinned npm tag
+bash install.sh 0.1.5-rc.1
+bash install.sh latest
 ```
 
 The installer is idempotent — re-running it skips already-applied patches and already-built artifacts.
@@ -80,22 +107,40 @@ and a `dsh` alias is auto-appended to `~/.bashrc` (created if missing, or
 6. **Installs the mobile UI plugin** [`dsh-web-mobile`](https://github.com/mexiaosqwq/dsh-web-mobile) (by @mexiaosqwq) — hides sidebar on narrow screens, directory becomes overlay drawer, conversation gets full width.
 7. **Runs a smoke test** to verify `node-pty` loads and the default shell resolves.
 
-### Plan B — precompiled native modules (recommended, no compilation)
+### Plan B — precompiled native modules (no compilation)
 
 No compilation at all: `node-pty` and `koffi` ship prebuilt for android-arm64
-(N-API, ABI-stable), and the sources are already patched, so the install is a
-plain download + extract:
+(N-API, ABI-stable) and the sources are already patched, so installing is a
+plain download + extract.
 
-```bash
-# Recommended: fully self-contained (whole patched dsh + node_modules, ~57 MB)
-npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
-dsh web
-```
+> [!IMPORTANT]
+> **This fork does not publish prebuilt release assets yet** — its Releases page
+> is empty, so there is no `releases/latest/download/...` URL to point at. Build
+> the tarballs once on this device (Plan A must have succeeded first), then
+> install them locally:
+>
+> ```bash
+> bash scripts/build-prebuilt.sh          # -> dsh-termux.tgz + dsh-termux-full.tgz
+> npm i -g ./dsh-termux-full.tgz          # ~57 MB, fully self-contained
+> dsh web
+> ```
+>
+> Once you attach those two files to a release in this fork, the short form
+> becomes available and equivalent:
+>
+> ```bash
+> npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
+> ```
+>
+> Do **not** use the upstream fork's release tarballs for a current install: they
+> were built from an older dsh (`0.1.0-rc.6` era) and do not match the patch set
+> documented here.
 
-A lighter variant is also released (see [`prebuilt/README.md`](prebuilt/README.md)):
-`dsh-termux.tgz` (~360 KB) — a postinstall fetches dsh from the npm registry
-(with npmjs→npmmirror fallback), applies the patches, and drops in the
-prebuilt natives. Prefer it only when the ~57 MB download is a concern.
+`dsh-termux-full.tgz` is the self-contained variant (whole patched dsh +
+`node_modules`, ~57 MB). The lighter `dsh-termux.tgz` (~360 KB) instead runs a
+postinstall that fetches dsh from the npm registry (npmjs→npmmirror fallback),
+applies the patches, and drops in the prebuilt natives — prefer it only when the
+~57 MB download is a concern. Details: [`prebuilt/README.md`](prebuilt/README.md).
 Maintainers rebuild both with
 [`scripts/build-prebuilt.sh`](scripts/build-prebuilt.sh).
 
@@ -158,7 +203,9 @@ Two ways to enable web search in the web UI:
    Restart `dsh web` once after installing the plugin.
 
 > [!WARNING]
-> Known issue (verified on dsh `0.1.0-rc.6`): installing `dsh-web-search-pro@0.1.2`
+> Known issue (reproduced on dsh `0.1.0-rc.6`; **not** re-tested on
+> `0.1.5-rc.2`, the version this fork validates): installing
+> `dsh-web-search-pro@0.1.2`
 > together with `@anweat/dsh-browser` broke the shared tool-dispatch layer —
 > every tool call (including the GUI's own tools) failed with
 > `Cannot read properties of undefined (reading 'prepare')`
@@ -211,6 +258,14 @@ re-apply it with `bash fix-dsh-runtime.sh`.
 - **Platform detection**: `process.platform` is `"android"` on Termux, so upstream `platform === "linux"` branches are extended to `platform === "linux" || platform === "android"`.
 - **Bash sandbox**: `bubblewrap` requires `user_namespaces` and specific `/proc` access that Android sepolicy denies. The harness detects this at runtime and degrades to a safe `SandboxUnavailableError` instead of crashing — subprocess execution itself still works via `node-pty`.
 - **Termux paths**: `termux-open` launches the Android VIEW intent (browser, file viewers, etc.).
+- **Install layout**: `@deepseek-ai/dsh` is a meta-package, so the patched code
+  lives in sibling packages whose path depends on the install method — a plain
+  `npm install -g` **hoists** them to `<prefix>/lib/node_modules`, while the
+  prebuilt tarball **nests** them in `<dsh>/node_modules`. The patcher and
+  `install.sh` resolve each package by walking `node_modules` upwards (Node's own
+  algorithm), so both layouts work; the `@img/sharp-wasm32` fallback and the
+  ripgrep shim are written into the `node_modules` their host package actually
+  resolves from.
 
 ## Project Structure
 
@@ -235,6 +290,9 @@ deepseek-harness-termux/
 
 ## Acknowledgements
 
+- **[Vengisk](https://github.com/Vengisk)** — original
+  [deepseek-harness-termux](https://github.com/Vengisk/deepseek-harness-termux)
+  compatibility layer this fork is based on.
 - **[DeepSeek AI](https://github.com/deepseek-ai)** for the excellent [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) agent framework.
 - **[@mexiaosqwq](https://github.com/mexiaosqwq)** for the [dsh-web-mobile](https://github.com/mexiaosqwq/dsh-web-mobile) mobile UI plugin.
 - **Termux Community** for the Android terminal environment.
@@ -246,4 +304,6 @@ MIT — same as the original [deepseek-harness](https://github.com/deepseek-ai/d
 
 ---
 
-*Maintained by [Vengisk](https://github.com/Vengisk) — not an official DeepSeek product.*
+*Maintained by [ThinkForge-core](https://github.com/ThinkForge-core) — a fork of
+[Vengisk/deepseek-harness-termux](https://github.com/Vengisk/deepseek-harness-termux),
+not an official DeepSeek product.*

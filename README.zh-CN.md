@@ -6,6 +6,13 @@
 
 ---
 
+> [!NOTE]
+> **本仓库是 [Vengisk/deepseek-harness-termux](https://github.com/Vengisk/deepseek-harness-termux) 的 fork。**
+> 原项目已在下方致谢;本页所有 clone / 安装命令均指向**本 fork**,以获得本文档所述的补丁流水线。
+> `upstream` 远程已指向原仓库,可用 `git fetch upstream && git merge upstream/main` 合入其改动。
+
+---
+
 `deepseek-harness-termux` 是一个社区维护的兼容层,将官方 [`@deepseek-ai/dsh`](https://github.com/deepseek-ai/deepseek-harness) 智能体框架移植到基于 [Termux](https://termux.com/) 的 Android 环境。官方 npm 包面向 glibc 系的 Linux 发行版构建,依赖的原生模块在 Android 的 Bionic libc 上要么编译失败、要么行为异常。本项目做法是直接修改关键源码以适配原生 Android 层,而不是禁用依赖这些模块的插件,让每个功能在 Termux 上都真实可用。
 
 所有修复由单一的、基于锚点的补丁集合 —— `scripts/apply-termux-fixes.mjs` —— 应用于干净的上游安装。它可重复执行，且当上游代码变动时**直接报错**，绝不会静默失效。修复的有序清单见 [`TERMUX-PATCHES.md`](TERMUX-PATCHES.md)。
@@ -46,6 +53,16 @@ Termux 构建中所有插件均启用并可用:
 
 ## 安装
 
+> [!IMPORTANT]
+> **受支持的 dsh 版本:`0.1.5-rc.2`(默认)。** 补丁器按精确锚点匹配上游代码,
+> 因此默认安装一个经过端到端验证的**固定版本**,而不是会变动的标签。
+>
+> 注意:npm 的 `latest` 标签当前是 `0.1.5-rc.1`,而最新的已发布预发布版是
+> `0.1.5-rc.2`(标签 `next`)——**`latest` 并不是最新的**。这个固定版本是出于
+> 可复现性,而非绕过某个缺陷:在干净环境中,完整补丁集对 **rc.1 与 rc.2 两者**
+> 都能全部应用(0 missing / 0 failed)。
+> 若指定其他版本且上游代码已变动,补丁器会**直接报错**,而不会留下半打补丁的安装。
+
 两种部署方式:
 
 ### 方案一 — 本机编译(install.sh)
@@ -53,12 +70,16 @@ Termux 构建中所有插件均启用并可用:
 完全可控,适用于任意 arm64 Termux;需一次性编译 `node-pty`/`koffi`(需要 clang + cmake + NDK sysroot,约 5–10 分钟):
 
 ```bash
-# 克隆本仓库
-git clone https://github.com/Vengisk/deepseek-harness-termux.git
+# 克隆本 fork
+git clone https://github.com/ThinkForge-core/deepseek-harness-termux.git
 cd deepseek-harness-termux
 
 # 运行自动化安装脚本(安装 dsh、应用补丁、编译 node-pty)
 bash install.sh
+
+# ...或显式指定:其他固定版本,或不固定的 npm 标签
+bash install.sh 0.1.5-rc.1
+bash install.sh latest
 ```
 
 安装脚本是幂等的 —— 重复执行时会跳过已应用的补丁和已构建的产物。
@@ -78,19 +99,34 @@ bash install.sh
 6. **安装移动端 UI 插件** [`dsh-web-mobile`](https://github.com/mexiaosqwq/dsh-web-mobile)(by @mexiaosqwq)——窄屏自动隐藏侧栏、目录变抽屉、会话全宽。
 7. **冒烟测试**:验证 `node-pty` 可以加载、默认 shell 可以解析。
 
-### 方案二 — 预编译原生模块(推荐,无需编译)
+### 方案二 — 预编译原生模块(无需编译)
 
-完全不需要编译:`node-pty` 和 `koffi` 已为 android-arm64 预编译(N-API,跨 Node 版本 ABI 稳定),源码也已打好转,安装就是纯下载 + 解压:
+完全不需要编译:`node-pty` 和 `koffi` 已为 android-arm64 预编译(N-API,跨 Node 版本 ABI 稳定),源码也已打好转,安装就是纯下载 + 解压。
 
-```bash
-# 推荐:完全自包含(整个打过补丁的 dsh + node_modules,约 57MB)
-npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
-dsh web
-```
+> [!IMPORTANT]
+> **本 fork 尚未发布预编译 release 产物** —— Releases 页面为空,因此不存在可用的
+> `releases/latest/download/...` 链接。请先在本机构建一次(需要方案一已成功执行),
+> 再本地安装:
+>
+> ```bash
+> bash scripts/build-prebuilt.sh          # 生成 dsh-termux.tgz + dsh-termux-full.tgz
+> npm i -g ./dsh-termux-full.tgz          # 约 57MB,完全自包含
+> dsh web
+> ```
+>
+> 把这两个文件上传到本 fork 的 release 后,即可使用等价的短命令:
+>
+> ```bash
+> npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
+> ```
+>
+> 请**不要**使用上游 fork 的 release 包做当前安装:它们构建自更旧的 dsh
+> (`0.1.0-rc.6` 时期),与本文档所述的补丁集合不匹配。
 
-另有精简变体(详见 [`prebuilt/README.md`](prebuilt/README.md)):
-`dsh-termux.tgz`(约 360KB)— postinstall 从 npm registry 拉取 dsh(npmjs→npmmirror
-自动回退)、应用补丁并放入预编译原生模块。仅当在意 ~57MB 下载体积时再选它。
+`dsh-termux-full.tgz` 是自包含变体(整个打过补丁的 dsh + `node_modules`,约 57MB)。
+更小的 `dsh-termux.tgz`(约 360KB)则由 postinstall 从 npm registry 拉取
+dsh(npmjs→npmmirror 自动回退)、应用补丁并放入预编译原生模块 —— 仅当在意
+~57MB 下载体积时再选它。详见 [`prebuilt/README.md`](prebuilt/README.md)。
 维护者用 [`scripts/build-prebuilt.sh`](scripts/build-prebuilt.sh) 重建两者。
 
 ## 使用方法
@@ -152,7 +188,8 @@ Web UI 里有两种开启网页搜索的方式:
    装完插件后重启一次 `dsh web`。
 
 > [!WARNING]
-> 已知问题(在 dsh `0.1.0-rc.6` 实测):安装 `dsh-web-search-pro@0.1.2` 及
+> 已知问题(在 dsh `0.1.0-rc.6` 上复现;**未**在本 fork 验证的
+> `0.1.5-rc.2` 上重新测试):安装 `dsh-web-search-pro@0.1.2` 及
 > `@anweat/dsh-browser` 后,共享工具分发层被破坏——所有工具调用(含 GUI 自带工具)
 > 都会报 `Cannot read properties of undefined (reading 'prepare')`
 > (即 `dsh-tools` 里 `scheduler.prepare` 处 `registry[TOOL_RUNTIME_SCHEDULER]`
@@ -216,6 +253,8 @@ deepseek-harness-termux/
 
 ## 致谢
 
+- **[Vengisk](https://github.com/Vengisk)** — 本 fork 所基于的原始
+  [deepseek-harness-termux](https://github.com/Vengisk/deepseek-harness-termux) 兼容层。
 - **[DeepSeek AI](https://github.com/deepseek-ai)** — 优秀的 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 智能体框架。
 - **[@mexiaosqwq](https://github.com/mexiaosqwq)** — [dsh-web-mobile](https://github.com/mexiaosqwq/dsh-web-mobile) 移动端 UI 适配插件。
 - **Termux 社区** — Android 终端环境。
@@ -227,4 +266,6 @@ MIT — 与官方 [deepseek-harness](https://github.com/deepseek-ai/deepseek-har
 
 ---
 
-*由 [Vengisk](https://github.com/Vengisk) 维护 — 非 DeepSeek 官方产品。*
+*由 [ThinkForge-core](https://github.com/ThinkForge-core) 维护 — 基于
+[Vengisk/deepseek-harness-termux](https://github.com/Vengisk/deepseek-harness-termux) 的
+fork,非 DeepSeek 官方产品。*

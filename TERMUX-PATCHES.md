@@ -1,7 +1,7 @@
 # Termux / Android fixes for `@deepseek-ai/dsh`
 
 This repository installs DeepSeek Harness on Android/Termux **and makes it
-actually run** there. Everything is designed for a *clean kernel*: install a
+actually run** there. Everything is designed for a *clean dsh tree*: install a
 fresh copy of dsh from npm, then apply one canonical patch set. No manual
 edits, no stub packages, no "disable the plugin and hope" workarounds.
 
@@ -23,6 +23,30 @@ bash install.sh
 # after every `npm install -g @deepseek-ai/dsh`
 bash fix-dsh-runtime.sh
 ```
+
+## Where the packages live (install layout)
+
+Upstream `@deepseek-ai/dsh` is a **meta-package**: the code being patched lives in
+sibling packages (`dsh-fs-local`, `dsh-workspace`, …), and their location depends
+on how dsh was installed:
+
+| Install method | Layout | Plugin path |
+|---|---|---|
+| `npm install -g` (what `install.sh` does) | **hoisted** | `<prefix>/lib/node_modules/@deepseek-ai/dsh-fs-local` |
+| vendored / prebuilt tarball | **nested** | `<prefix>/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-fs-local` |
+
+Neither the patcher nor `install.sh` may hardcode one of them. Both resolve a
+package by walking `node_modules` upwards from the dsh root — exactly like Node's
+own resolver — so the nested copy wins when present and the hoisted copy is found
+otherwise. This matters for more than "file not found": `sharp` and
+`@vscode/ripgrep` are hoisted too, so the `@img/sharp-wasm32` fallback and the
+ripgrep shim must be written into the `node_modules` directory the package was
+actually resolved from, not into `<dsh>/node_modules`. When they were written to
+the wrong place, `sharp` still failed to load even though the patch reported
+success.
+
+Verified in a clean room (`npm install --prefix … --ignore-scripts
+@deepseek-ai/dsh@0.1.5-rc.2`, no prior state) on both layouts.
 
 ## Root cause that drives most patches
 
@@ -76,14 +100,19 @@ the old modules in memory.
 ```bash
 # one file
 cp -a <file>.orig-termux <file> && rm <file>.orig-termux
-# sharp
-NM="$(npm root -g)/@deepseek-ai/dsh/node_modules"; rm -rf "$NM/sharp" && mv "$NM/sharp.real" "$NM/sharp"
+
+# sharp — lives where the package was resolved from, so do not hardcode a layout.
+# The .real backup marks the right directory: nested in a vendored/prebuilt tree,
+# beside the core in a hoisted `npm install -g` tree.
+DSH="$(npm root -g)/@deepseek-ai/dsh"; NM="$DSH/node_modules"
+[ -d "$NM/sharp.real" ] || NM="$(npm root -g)"
+rm -rf "$NM/sharp" && mv "$NM/sharp.real" "$NM/sharp"
 ```
 
 ## A note on the old approach (removed)
 
 Earlier revisions of this repo shipped ten `.patch` files that targeted an
-older kernel; on 0.1.5-rc.2 most either did not apply or applied only partly
+older dsh release; on 0.1.5-rc.2 most either did not apply or applied only partly
 (e.g. the session `link()` fix marked one of three real call sites). They were
 also eaten silently by `patch --forward`. They are gone. The anchor-based
 patcher replaces them: if upstream code changes, it **fails loudly** instead of

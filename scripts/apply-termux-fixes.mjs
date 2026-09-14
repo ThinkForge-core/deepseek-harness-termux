@@ -8,7 +8,7 @@
 // Every edit is anchor-based. If an upstream anchor is missing the fix FAILS
 // LOUDLY instead of silently doing nothing, so a silent no-op can never happen
 // (the failure mode the old .patch files had). Nothing here assumes the tree
-// is already patched, so it is safe on a completely clean kernel.
+// is already patched, so it is safe on a completely clean dsh tree.
 //
 // Root cause common to several fixes: Android sepolicy denies hardlink(2) in
 // app-private storage -> every link()-based "atomic publish" must fall back to
@@ -34,7 +34,7 @@ import {
   mkdirSync, readdirSync, chmodSync, symlinkSync, unlinkSync, readlinkSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 
@@ -43,6 +43,39 @@ const npmRoot = execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim()
 const DSH = process.env.DSH_DIR || join(npmRoot, '@deepseek-ai/dsh');
 const NM = join(DSH, 'node_modules');
 const P = join(NM, '@deepseek-ai');
+
+// ── where do the packages actually live? ────────────────────────────────────
+// The layout depends on HOW dsh was installed:
+//   * vendored / prebuilt tarball -> every dep is nested in <dsh>/node_modules
+//   * plain `npm install -g`      -> npm hoists deps to <prefix>/lib/node_modules
+// So the plugin packages cannot be addressed by a single hardcoded path. Walk
+// the node_modules chain upwards from the dsh root exactly like Node's own
+// resolver: the nested copy wins when present, the hoisted one is found
+// otherwise. Both layouts then work unchanged.
+function resolvePkgDir(name) {
+  let dir = DSH;
+  for (;;) {
+    const candidate = join(dir, 'node_modules', name);
+    if (existsSync(candidate)) return candidate;
+    const up = join(dir, '..');
+    if (up === dir) return null;
+    dir = up;
+  }
+}
+// Absolute path of `rel` inside package `name`. When the package is absent the
+// path is unpacked relative to P so the "file missing" warning stays meaningful.
+function pkg(name, rel) {
+  const dir = resolvePkgDir(name) || join(P, name);
+  return rel ? join(dir, rel) : dir;
+}
+// The node_modules directory a package was resolved from: strip the package's
+// own path segments off its directory (`<nm>/sharp` -> `<nm>`, and
+// `<nm>/@vscode/ripgrep` -> `<nm>`). Siblings installed here are visible to it.
+function nmRootOf(name, dir) {
+  let root = dir;
+  for (let i = 0; i < name.split('/').length; i++) root = dirname(root);
+  return root;
+}
 const RG_SYSTEM = process.env.RG_SYSTEM || '/data/data/com.termux/files/usr/bin/rg';
 
 const C = { g: '\x1b[32m', y: '\x1b[33m', r: '\x1b[31m', c: '\x1b[36m', z: '\x1b[0m', d: '\x1b[2m' };
@@ -82,7 +115,7 @@ function fix(file, label, marker, fn) {
 
 // ── 1. sharp ────────────────────────────────────────────────────────────────
 const SHARP_MIN = '0.35.4';
-function installWasmSharp(version) {
+function installWasmSharp(version, nm) {
   const stage = join(tmpdir(), `dsh-sharp-wasm-${process.pid}`);
   rmSync(stage, { recursive: true, force: true });
   mkdirSync(stage, { recursive: true });
@@ -90,9 +123,9 @@ function installWasmSharp(version) {
   try {
     execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', `@img/sharp-wasm32@${version}`], { cwd: stage, stdio: 'inherit' });
     for (const [rel, dest] of [
-      ['@img/sharp-wasm32', join(NM, '@img/sharp-wasm32')],
-      ['@emnapi/runtime', join(NM, '@emnapi/runtime')],
-      ['tslib', join(NM, 'tslib')],
+      ['@img/sharp-wasm32', join(nm, '@img/sharp-wasm32')],
+      ['@emnapi/runtime', join(nm, '@emnapi/runtime')],
+      ['tslib', join(nm, 'tslib')],
     ]) {
       const from = join(stage, 'node_modules', rel);
       if (!existsSync(from)) { warn(`wasm dep not produced: ${rel}`); continue; }
@@ -105,8 +138,12 @@ function installWasmSharp(version) {
 }
 function fixSharp() {
   step('1/13 sharp: real module + @img/sharp-wasm32 runtime fallback');
-  const sharpDir = join(NM, 'sharp');
-  const realDir = join(NM, 'sharp.real');
+  // sharp is hoisted to <prefix>/lib/node_modules on a plain global install and
+  // nested under <dsh>/node_modules in the vendored layout — resolve it, then
+  // install the wasm fallback into the SAME node_modules sharp loads from.
+  const sharpDir = pkg('sharp');
+  const sharpNM = nmRootOf('sharp', sharpDir);
+  const realDir = join(sharpNM, 'sharp.real');
   let version = SHARP_MIN;
   const versionOf = (dir) => existsSync(join(dir, 'package.json'))
     ? (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version || '') : '';
@@ -123,7 +160,7 @@ function fixSharp() {
   }
   // The official loader itself falls back to @img/sharp-wasm32 when no native
   // binding exists — no stub needed.
-  if (!existsSync(join(NM, '@img/sharp-wasm32/index.cjs'))) { installWasmSharp(version); stats.changed++; }
+  if (!existsSync(join(sharpNM, '@img/sharp-wasm32/index.cjs'))) { installWasmSharp(version, sharpNM); stats.changed++; }
   else skip('@img/sharp-wasm32 already installed');
   try {
     const out = execFileSync(process.execPath, ['-e', 'const s=require("sharp");console.log(`sharp ${s.versions.sharp} / vips ${s.versions.vips}`)'], { cwd: DSH, encoding: 'utf8' });
@@ -160,7 +197,7 @@ const FSL_TO = `\t\tif (createIfAbsent !== void 0) try {
 \t\t}`;
 function fixFsLocal() {
   step('2/13 fs-local: link(2) -> rename(2) for the atomic write publish');
-  fix(join(P, 'dsh-fs-local/lib/index.js'), 'fs-local writeFileAtomic', 'Termux/Android: sepolicy denies link(2) (EACCES/EPERM). Emulate the', (src) => sub(src, FSL_FROM, FSL_TO));
+  fix(pkg('@deepseek-ai/dsh-fs-local', 'lib/index.js'), 'fs-local writeFileAtomic', 'Termux/Android: sepolicy denies link(2) (EACCES/EPERM). Emulate the', (src) => sub(src, FSL_FROM, FSL_TO));
 }
 
 // ── 3. session-persistence ─────────────────────────────────────────────────
@@ -206,13 +243,13 @@ function ensureRenameImport(src) {
 function fixSessionLink() {
   step('3/13 session-persistence-jsonl: link(2) -> rename(2) fallback');
   const M = 'Android sepolicy blocks link(2)';
-  fix(join(P, 'dsh-session-persistence-jsonl/lib/index.js'), 'index.js', M, (src) => {
+  fix(pkg('@deepseek-ai/dsh-session-persistence-jsonl', 'lib/index.js'), 'index.js', M, (src) => {
     src = ensureRenameImport(src);
     src = sub(src, LINK_A_FROM, LINK_A_TO);
     src = sub(src, LINK_B_FROM, LINK_B_TO);
     return src;
   });
-  fix(join(P, 'dsh-session-persistence-jsonl/lib/worker.cjs'), 'worker.cjs', M, (src) => sub(src, LINK_A_FROM, LINK_A_TO));
+  fix(pkg('@deepseek-ai/dsh-session-persistence-jsonl', 'lib/worker.cjs'), 'worker.cjs', M, (src) => sub(src, LINK_A_FROM, LINK_A_TO));
 }
 
 // ── 4. attachment-local: file uploads ──────────────────────────────────────
@@ -261,7 +298,7 @@ const ATT_STAGED_TO = `\t\tlet publishedByRename = false;
 function fixAttachment() {
   step('4/13 attachment-local: link(2) -> rename/copyFile for file uploads');
   const M = 'Termux/Android: sepolicy denies link(2)';
-  fix(join(P, 'dsh-attachment-local/lib/index.js'), 'attachment-local', M, (src) => {
+  fix(pkg('@deepseek-ai/dsh-attachment-local', 'lib/index.js'), 'attachment-local', M, (src) => {
     src = sub(src,
       'import { chmod, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";',
       'import { chmod, copyFile, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";');
@@ -274,7 +311,7 @@ function fixAttachment() {
 // ── 5. flock ───────────────────────────────────────────────────────────────
 function fixFlock() {
   step('5/13 node-addon-system: flock(2) no-op on android');
-  fix(join(P, 'node-addon-system/lib/flock.js'), 'flock.js', 'IS_ANDROID', (src) => {
+  fix(pkg('@deepseek-ai/node-addon-system', 'lib/flock.js'), 'flock.js', 'IS_ANDROID', (src) => {
     src = sub(src, "import { getSystemErrorName } from 'node:util';", "import { getSystemErrorName } from 'node:util';\n\nconst IS_ANDROID = process.platform === 'android';");
     src = sub(src, 'export async function tryLockExclusive(fd) {\n', 'export async function tryLockExclusive(fd) {\n    if (IS_ANDROID) {\n        /* single-process on Termux: in-process write claim already excludes writers */\n        return;\n    }\n');
     return src;
@@ -284,7 +321,7 @@ function fixFlock() {
 // ── 6. subprocess-local ────────────────────────────────────────────────────
 function fixSubprocess() {
   step('6/13 subprocess-local: allow android in the process inspector');
-  const dir = join(P, 'dsh-subprocess-local/lib');
+  const dir = pkg('@deepseek-ai/dsh-subprocess-local', 'lib');
   if (!existsSync(dir)) { warn('subprocess-local: lib missing'); stats.missing++; return; }
   for (const f of readdirSync(dir)) {
     if (!(f.startsWith('runner-launch-') && f.endsWith('.js'))) continue;
@@ -303,7 +340,7 @@ function fixSubprocess() {
 // ── 7. terminal shell ──────────────────────────────────────────────────────
 function fixTerminalShell() {
   step('7/13 terminal-bash: default shell that exists on Termux');
-  fix(join(P, 'dsh-terminal-bash/lib/index.js'), 'terminal-bash', 'files/usr/bin/bash', (src) => {
+  fix(pkg('@deepseek-ai/dsh-terminal-bash', 'lib/index.js'), 'terminal-bash', 'files/usr/bin/bash', (src) => {
     if (!/import \{ existsSync \} from "node:fs";/.test(src)) src = sub(src, 'import { createRequire } from "node:module";', 'import { existsSync } from "node:fs";\nimport { createRequire } from "node:module";');
     src = sub(src, 'const DEFAULT_BASH_SHELL = "/bin/bash";', 'const DEFAULT_BASH_SHELL = process.platform === "android"\n\t? (existsSync("/data/data/com.termux/files/usr/bin/bash")\n\t\t? "/data/data/com.termux/files/usr/bin/bash"\n\t\t: (existsSync("/system/bin/sh") ? "/system/bin/sh" : "/bin/sh"))\n\t: "/bin/bash";');
     return src;
@@ -313,14 +350,14 @@ function fixTerminalShell() {
 // ── 8. sandbox proot ───────────────────────────────────────────────────────
 function fixSandboxProot() {
   step('8/13 sandbox-local: proot runner for android');
-  const file = join(P, 'dsh-sandbox-local/lib/index.js');
+  const file = pkg('@deepseek-ai/dsh-sandbox-local', 'lib/index.js');
   if (!existsSync(file)) { warn('sandbox-local: file missing'); stats.missing++; return; }
   if (readFileSync(file, 'utf8').includes('prootProfileArgs')) { skip('sandbox-local: already applied'); stats.skipped++; return; }
   const patchFile = join(REPO, 'patches/07-sandbox-local-proot-runner.patch');
   if (!existsSync(patchFile)) { err('sandbox-local: patch file missing'); stats.failed++; return; }
   try {
     backup(file);
-    execFileSync('patch', ['-p1', '--forward', '-i', patchFile], { cwd: join(P, 'dsh-sandbox-local'), stdio: 'inherit' });
+    execFileSync('patch', ['-p1', '--forward', '-i', patchFile], { cwd: pkg('@deepseek-ai/dsh-sandbox-local', ''), stdio: 'inherit' });
     touched.add(file);
     ok('sandbox-local: proot patch applied');
     stats.changed++;
@@ -330,7 +367,7 @@ function fixSandboxProot() {
 // ── 9. native-command ──────────────────────────────────────────────────────
 function fixNativeCommand() {
   step('9/13 native-command: termux-open on android');
-  fix(join(P, 'dsh-native-command/lib/index.js'), 'native-command', 'termux-open', (src) => {
+  fix(pkg('@deepseek-ai/dsh-native-command', 'lib/index.js'), 'native-command', 'termux-open', (src) => {
     src = sub(src, '\tif (platform === "linux") {\n\t\tconst browser = env.BROWSER;\n\t\tif (browser === void 0 || browser === "") return false;\n\t\tawait run(browser, [path], signal);\n\t\treturn true;\n\t}\n\treturn false;', '\tif (platform === "linux") {\n\t\tconst browser = env.BROWSER;\n\t\tif (browser === void 0 || browser === "") return false;\n\t\tawait run(browser, [path], signal);\n\t\treturn true;\n\t}\n\tif (platform === "android") {\n\t\tawait run("termux-open", [path], signal);\n\t\treturn true;\n\t}\n\treturn false;');
     src = sub(src, '\tif (platform === "linux") {\n\t\tif (wsl) {\n\t\t\tawait openWslPath(path, signal, run);\n\t\t\treturn;\n\t\t}\n\t\tawait run("xdg-open", [path], signal);\n\t\treturn;\n\t}\n\tthrow new Error(`native path opener is unsupported on ${platform}`);', '\tif (platform === "android") {\n\t\tawait run("termux-open", [path], signal);\n\t\treturn;\n\t}\n\tif (platform === "linux") {\n\t\tif (wsl) {\n\t\t\tawait openWslPath(path, signal, run);\n\t\t\treturn;\n\t\t}\n\t\tawait run("xdg-open", [path], signal);\n\t\treturn;\n\t}\n\tthrow new Error(`native path opener is unsupported on ${platform}`);');
     src = sub(src, '\tif (platform === "darwin" || platform === "win32") return true;\n\tif (platform !== "linux") return false;', '\tif (platform === "darwin" || platform === "win32") return true;\n\tif (platform === "android") return true;\n\tif (platform !== "linux") return false;');
@@ -341,7 +378,7 @@ function fixNativeCommand() {
 // ── 10. directory picker ───────────────────────────────────────────────────
 function fixDirectoryPicker() {
   step('10/13 host-directory-picker-native: android uses zenity');
-  fix(join(P, 'dsh-host-directory-picker-native/lib/index.js'), 'directory-picker-native', 'platform === "android"', (src) => sub(src,
+  fix(pkg('@deepseek-ai/dsh-host-directory-picker-native', 'lib/index.js'), 'directory-picker-native', 'platform === "android"', (src) => sub(src,
     'if (platform === "linux") {\n\t\ttry {\n\t\t\treturn outputPath((await run("zenity", [',
     'if (platform === "linux" || platform === "android") {\n\t\ttry {\n\t\t\treturn outputPath((await run("zenity", ['));
 }
@@ -349,7 +386,7 @@ function fixDirectoryPicker() {
 // ── 11. workspace archive ──────────────────────────────────────────────────
 function fixWorkspaceArchive() {
   step('11/13 workspace: archiveSession tolerates unpersisted sessions');
-  fix(join(P, 'dsh-workspace/lib/index.js'), 'workspace', 'Termux: skip the sessionKnown()', (src) => sub(src,
+  fix(pkg('@deepseek-ai/dsh-workspace', 'lib/index.js'), 'workspace', 'Termux: skip the sessionKnown()', (src) => sub(src,
     'if (!await this.sessionKnown(sessionId)) throw new WorkspaceUnknownSessionError(sessionId);',
     '// Termux: skip the sessionKnown() existence check. Sessions visible in the\n\t\t\t// UI may be absent from persistence (empty session dirs after an unclean\n\t\t\t// shutdown, or live sessions that were never persisted). Archiving is\n\t\t\t// just appending an id to a list and must not require storage presence.'));
 }
@@ -358,7 +395,11 @@ function fixWorkspaceArchive() {
 function fixRipgrepShim() {
   step('12/13 ripgrep: @vscode/ripgrep-android-arm64 shim -> system rg');
   if (!existsSync(RG_SYSTEM)) { warn(`system rg not found at ${RG_SYSTEM} (pkg install ripgrep)`); stats.missing++; return; }
-  const shim = join(NM, '@vscode/ripgrep-android-arm64');
+  // The shim must be require-able from @vscode/ripgrep, so it goes in the same
+  // node_modules that package was resolved from (and under @vscode/, matching
+  // the upstream platform-package naming).
+  const rgDir = pkg('@vscode/ripgrep');
+  const shim = join(nmRootOf('@vscode/ripgrep', rgDir), '@vscode/ripgrep-android-arm64');
   const bin = join(shim, 'bin', 'rg');
   try {
     if (readlinkSync(bin) === RG_SYSTEM && existsSync(join(shim, 'package.json'))) { skip('ripgrep shim already present'); stats.skipped++; return; }

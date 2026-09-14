@@ -8,9 +8,9 @@
 #   dsh-termux-full.tgz   (vendored, ~55 MB)  — fully offline; bundles the
 #                          entire patched dsh + node_modules incl. natives
 #
-# Users install either with:
-#   npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux.tgz
-#   npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
+# Users install either with (URLs go live once attached to a release in this fork):
+#   npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux.tgz
+#   npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
 #
 # Usage:
 #   bash scripts/build-prebuilt.sh                 # uses the global install
@@ -38,16 +38,75 @@ if [ ! -f "$DSH_DIR/package.json" ]; then
 fi
 echo "==> Using patched install at: $DSH_DIR"
 
-PTY="$DSH_DIR/node_modules/node-pty/build/Release/pty.node"
-KOFFI="$DSH_DIR/node_modules/koffi/build/koffi/android_arm64/koffi.node"
+# Resolve a package the way Node does: walk node_modules upwards from the dsh
+# root. `npm install -g` HOISTS these siblings out of the dsh tree; a vendored /
+# prebuilt install NESTS them inside it. Hardcoding either one makes this script
+# fail on the other — the same bug class already fixed in install.sh and in
+# scripts/apply-termux-fixes.mjs.
+resolve_pkg_dir() {
+    local name="$1" dir="$DSH_DIR" up
+    while :; do
+        if [ -d "$dir/node_modules/$name" ]; then printf '%s\n' "$dir/node_modules/$name"; return 0; fi
+        up="$(dirname "$dir")"
+        [ "$up" = "$dir" ] && return 0
+        dir="$up"
+    done
+}
+
+PTY_DIR="$(resolve_pkg_dir node-pty)"
+KOFFI_DIR="$(resolve_pkg_dir koffi)"
+SHARP_DIR="$(resolve_pkg_dir '@img/sharp-wasm32')"
+if [ -z "$PTY_DIR" ]; then
+    echo "[ERROR] node-pty not found in any node_modules above $DSH_DIR"
+    echo "        Run install.sh first, or set DSH_DIR=/path/to/dsh"
+    exit 1
+fi
+if [ -z "$KOFFI_DIR" ]; then
+    echo "[ERROR] koffi not found in any node_modules above $DSH_DIR"
+    echo "        Run install.sh first, or set DSH_DIR=/path/to/dsh"
+    exit 1
+fi
+
+PTY="$PTY_DIR/build/Release/pty.node"
+
+# koffi's native addon lives in one of two places depending on how it got here:
+#   * install.sh builds koffi from source and copies the addon to the canonical
+#     build/koffi/android_arm64/koffi.node  — this is what prebuilt/install.js
+#     drops and what the tarballs are expected to carry;
+#   * a plain npm install uses koffi's platform package instead
+#     (@koromix/koffi-android-arm64/android_arm64/koffi.node) and has no build/
+#     at all. Note that `require('koffi')` still succeeds in that case: the addon
+#     is loaded lazily, so a bare require proves nothing about its presence.
+KOFFI=""
+if [ -d "$KOFFI_DIR/build" ]; then
+    KOFFI="$(find "$KOFFI_DIR/build" -type f -name 'koffi.node' 2>/dev/null | head -1 || true)"
+fi
+KOFFI_PLATFORM="$(find "$(dirname "$KOFFI_DIR")" -path '*@koromix*' -type f -name 'koffi.node' 2>/dev/null | head -1 || true)"
+
 if [ ! -f "$PTY" ]; then
     echo "[ERROR] missing $PTY — run install.sh first"
     exit 1
 fi
-if [ ! -f "$KOFFI" ]; then
-    echo "[ERROR] missing $KOFFI — run install.sh first"
+if [ -z "$KOFFI" ] || [ ! -f "$KOFFI" ]; then
+    echo "[ERROR] no source-built koffi addon under $KOFFI_DIR/build"
+    if [ -n "$KOFFI_PLATFORM" ]; then
+        echo "        koffi here resolves its addon from a platform package:"
+        echo "          $KOFFI_PLATFORM"
+        echo "        prebuilt/install.js expects the SOURCE-BUILT path"
+        echo "        (koffi/build/koffi/android_arm64/koffi.node), so this tree"
+        echo "        cannot produce the tarballs as they are currently defined."
+        echo "        Build from a tree created by install.sh, or update the"
+        echo "        packaging to carry the platform package."
+    else
+        echo "        Run install.sh first (it builds koffi from source)."
+    fi
     exit 1
 fi
+case "$PTY_DIR" in
+    "$DSH_DIR"/*) LAYOUT="nested" ;;
+    *)            LAYOUT="hoisted" ;;
+esac
+echo "    layout   : $LAYOUT"
 echo "    pty.node : $PTY"
 echo "    koffi    : $KOFFI"
 
@@ -88,6 +147,24 @@ build_layered() {
 # ── 3b. Vendored tarball (full offline; whole patched dsh + node_modules) ───
 build_full() {
     echo "==> Building vendored tarball (dsh-termux-full.tgz)..."
+
+    # The vendored tarball is `cp -a "$DSH_DIR/."` — a snapshot that has to be
+    # SELF-CONTAINED. That holds only in the nested layout, where the natives
+    # live inside the dsh tree. With a hoisted install they sit outside it and
+    # the tarball would ship without node-pty/koffi — refuse instead of
+    # producing a broken artifact.
+    case "$PTY_DIR" in
+        "$DSH_DIR"/*) ;;
+        *)
+            echo "[ERROR] this DSH_DIR is a hoisted install: node-pty lives at"
+            echo "        $PTY_DIR"
+            echo "        which is outside $DSH_DIR, so it would not travel in the"
+            echo "        vendored tarball. Build the full tarball from a vendored"
+            echo "        install, or build only the layered one (MODES=layered)."
+            return 1
+            ;;
+    esac
+
     STAGE="$(mktemp -d)"
     FULL_PKG="$STAGE/package"
     mkdir -p "$FULL_PKG"
@@ -99,25 +176,19 @@ build_full() {
     # prebuilds/<platform>-<arch>/ exists — otherwise npm falls back to
     # node-gyp rebuild and tries to COMPILE. Mirror the binary there so a
     # plain `npm i -g` (no --ignore-scripts) never compiles.
-    if [ -f "$DSH_DIR/node_modules/node-pty/build/Release/pty.node" ]; then
+    if [ -f "$PTY" ]; then
         mkdir -p "$FULL_PKG/node_modules/node-pty/prebuilds/android-arm64"
-        cp "$DSH_DIR/node_modules/node-pty/build/Release/pty.node" \
+        cp "$PTY" \
            "$FULL_PKG/node_modules/node-pty/prebuilds/android-arm64/pty.node"
         chmod 755 "$FULL_PKG/node_modules/node-pty/prebuilds/android-arm64/pty.node"
         echo "    -> node-pty prebuild mirrored (prebuilds/android-arm64/pty.node)"
     fi
 
-    # sharp's wasm fallback must live INSIDE the vendored tree (the layered
-    # install drops it at the global root; here it must travel with the package)
+    # sharp's wasm fallback must live INSIDE the vendored tree
     if [ ! -d "$FULL_PKG/node_modules/@img/sharp-wasm32" ]; then
-        # install.sh puts it inside the dsh tree; the layered prebuilt puts it
-        # at the global root — prefer a local copy before falling back to npm
-        if [ -d "$DSH_DIR/node_modules/@img/sharp-wasm32" ]; then
+        if [ -n "$SHARP_DIR" ] && [ -d "$SHARP_DIR" ]; then
             mkdir -p "$FULL_PKG/node_modules/@img"
-            cp -a "$DSH_DIR/node_modules/@img/sharp-wasm32" "$FULL_PKG/node_modules/@img/"
-        elif [ -d "$(dirname "$DSH_DIR")/@img/sharp-wasm32" ]; then
-            mkdir -p "$FULL_PKG/node_modules/@img"
-            cp -a "$(dirname "$DSH_DIR")/@img/sharp-wasm32" "$FULL_PKG/node_modules/@img/"
+            cp -a "$SHARP_DIR" "$FULL_PKG/node_modules/@img/"
         else
             echo "    -> fetching @img/sharp-wasm32 into the vendored tree..."
             (cd "$FULL_PKG" && env -u npm_config_prefix -u npm_config_global \
@@ -176,6 +247,6 @@ for mode in $MODES; do
 done
 
 echo ""
-echo "==> Done. Upload both to a GitHub release, then users install:"
-echo "    npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux.tgz"
-echo "    npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz"
+echo "==> Done. Upload both to a release in this fork, then users install:"
+echo "    npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux.tgz"
+echo "    npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz"

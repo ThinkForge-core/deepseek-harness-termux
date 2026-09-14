@@ -11,10 +11,20 @@
 
 ## 安装 — 两种模式
 
+> [!IMPORTANT]
+> 这些包是**本机构建产物,并未发布为 release 资产**。本 fork 目前没有 release,
+> 因此下面的 `releases/latest/download/...` 链接在上传前**不可用**。
+> 在此之前请先构建一次,再本地安装(见文末「维护者:重建预编译包」):
+>
+> ```bash
+> bash scripts/build-prebuilt.sh
+> npm i -g ./dsh-termux-full.tgz
+> ```
+
 ### 全量模式(完全自包含,约 57MB)— 推荐
 
 ```bash
-npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
+npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
 dsh web
 ```
 
@@ -26,7 +36,7 @@ dsh web
 ### 精简模式(小,约 360KB)
 
 ```bash
-npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux.tgz
+npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux.tgz
 dsh web
 ```
 
@@ -65,7 +75,7 @@ bash install.sh
 # 2. 打包(默认两种模式都打)
 DSH_DIR="$(npm root -g)/@deepseek-ai/dsh" bash scripts/build-prebuilt.sh
 #    MODES=layered 或 MODES=full 只打其中一种
-# 3. 把 dsh-termux.tgz 和 dsh-termux-full.tgz 上传到 GitHub Release,
+# 3. 把 dsh-termux.tgz 和 dsh-termux-full.tgz 上传到本 fork 的 GitHub Release,
 #    用户即可从上面的 releases/latest/download 地址安装
 ```
 

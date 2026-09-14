@@ -12,10 +12,22 @@ needed.
 
 ## Install — two variants
 
+> [!IMPORTANT]
+> These packages are **built locally, not published as release assets**. This fork
+> has no releases yet, so the `releases/latest/download/...` URLs below are not
+> live until you build the tarballs and attach them to a release (see
+> [Rebuilding](#rebuilding-the-prebuilt-packages-for-maintainers)). Until then,
+> build them once and install the files directly:
+>
+> ```bash
+> bash scripts/build-prebuilt.sh
+> npm i -g ./dsh-termux-full.tgz
+> ```
+
 ### Vendored (fully self-contained, ~57 MB) — recommended
 
 ```bash
-npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
+npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux-full.tgz
 dsh web
 ```
 
@@ -28,7 +40,7 @@ from the bundle quickly.
 ### Layered (small, ~360 KB)
 
 ```bash
-npm i -g https://github.com/Vengisk/deepseek-harness-termux/releases/latest/download/dsh-termux.tgz
+npm i -g https://github.com/ThinkForge-core/deepseek-harness-termux/releases/latest/download/dsh-termux.tgz
 dsh web
 ```
 
@@ -71,8 +83,8 @@ bash install.sh
 # 2. package the tarballs (both modes by default)
 DSH_DIR="$(npm root -g)/@deepseek-ai/dsh" bash scripts/build-prebuilt.sh
 #    MODES=layered | MODES=full to build only one
-# 3. upload dsh-termux.tgz and dsh-termux-full.tgz to a GitHub release, then
-#    users can install from the releases/latest/download URLs above
+# 3. upload dsh-termux.tgz and dsh-termux-full.tgz to a GitHub release in THIS
+#    fork, then users can install from the releases/latest/download URLs above
 ```
 
 The natives are N-API so they keep working across `dsh` updates; only bump the

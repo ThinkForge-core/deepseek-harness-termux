@@ -6,7 +6,7 @@
 #
 # Run this after `npm install -g @deepseek-ai/dsh` (an upgrade restores the
 # whole tree to pristine upstream files) or whenever a dsh feature misbehaves.
-# It is idempotent and works on a completely clean kernel — nothing here
+# It is idempotent and works on a completely clean dsh tree — nothing here
 # depends on the tree already being patched.
 #
 # The actual work lives in scripts/apply-termux-fixes.mjs so that install.sh
