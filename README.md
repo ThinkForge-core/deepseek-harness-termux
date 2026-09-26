@@ -57,18 +57,20 @@ Every plugin is enabled and working in the Termux build:
 ## Installation
 
 > [!IMPORTANT]
-> **Supported dsh version: `0.1.5-rc.2` (default).** The patcher matches upstream
-> code by exact anchors, so the patch set is validated against one release and
-> installed explicitly rather than through a moving tag — that is what the
+> **Supported dsh version: `0.1.7-rc.2` (default).** The patcher matches upstream
+> code by exact anchors, so the patch set is validated against specific releases
+> and installed explicitly rather than through a moving tag — that is what the
 > default pin is for.
 >
-> Note that npm's `latest` tag is currently `0.1.5-rc.1` while the newest
-> published prerelease is `0.1.5-rc.2` (tagged `next`): **`latest` is not the
-> newest**. The pin is a reproducibility choice, not a workaround — a clean-room
-> run applied the complete patch set to **both** rc.1 and rc.2 with zero missing
-> and zero failed fixes. If you pass a different version and upstream moved the
-> code, the patcher **fails loudly** rather than producing a half-patched
-> install.
+> npm's `latest` tag is **not** the newest prerelease, so the pin, not `latest`,
+> is what the installer targets by default. The pin is a reproducibility choice,
+> not a workaround: a clean-room run applied the complete patch set to both
+> `0.1.5-rc.1` and `0.1.5-rc.2` with zero missing and zero failed fixes, and the
+> three anchors `0.1.7-rc.2` moved are handled by shape lists and were re-checked
+> against a pristine tree of that version. If you pass a version whose anchors
+> moved, the patcher **fails loudly** rather than producing a half-patched
+> install — and it ends by re-reading every fix from disk, so a half-patched tree
+> cannot pass as a successful run.
 
 Two deployment options:
 
@@ -242,7 +244,7 @@ ones stay as `.patch` files:
 | flock | `node-addon-system` | `flock(2)` no-op on Android (Bionic has no such syscall) |
 | subprocess-local | `dsh-subprocess-local` | Treats `android` like `linux` for process-group inspection |
 | terminal-bash | `dsh-terminal-bash` | Resolves a shell binary that really exists on Termux |
-| sandbox-local | `dsh-sandbox-local` | Uses `proot` as the sandbox runner ([patch](patches/07-sandbox-local-proot-runner.patch)) |
+| sandbox-local | `dsh-sandbox-local` | Uses `proot` as the sandbox runner, and never the `--` separator proot rejects ([patch](patches/07-sandbox-local-proot-runner.patch) + anchor fix) |
 | native-command | `dsh-native-command` | Opens paths/URLs via `termux-open` on Android |
 | directory-picker | `dsh-host-directory-picker-native` | Routes directory picking through the zenity path on Android |
 | workspace | `dsh-workspace` | Skips the session-known check when archiving |

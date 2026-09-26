@@ -49,7 +49,20 @@ print_subfooter() { echo -e "${MAGENTA}└────────────�
 # that has been validated end-to-end rather than a moving tag. Note that npm's
 # `latest` tag currently points at an OLDER prerelease (0.1.5-rc.1) than the
 # newest published one (0.1.5-rc.2 = `next`), so `latest` is not the newest.
-readonly VALIDATED_DSH_VERSION="0.1.5-rc.2"
+#
+# 0.1.7-rc.2 moved three anchors the 0.1.5 pin relied on, and one of them
+# (sandbox-local's `confine()`) failed as a .patch hunk, which left the proot
+# runner registered with a `--` in front of every command — a dead sandbox, and
+# with it a dead bash and a dead write/edit. All three are handled now:
+#   * sandbox-local  — the `--` separator is placed by anchor, for both shapes of
+#                      confine(), and the patch's own additions are verified by
+#                      marker instead of trusted to patch's exit code;
+#   * terminal-bash  — the import is prepended instead of anchored to a neighbour;
+#   * workspace      — the archiveSession() guard grew an argument and is matched
+#                      in both shapes.
+# The patcher re-reads every fix it wrote before it exits, so a core that drifts
+# again fails loudly instead of leaving a half-patched tree behind.
+readonly VALIDATED_DSH_VERSION="0.1.7-rc.2"
 TARGET_VERSION="${1:-$VALIDATED_DSH_VERSION}"
 if [ "$TARGET_VERSION" = "latest" ]; then VERSION_DISPLAY="latest (unpinned)"; else VERSION_DISPLAY="v$TARGET_VERSION"; fi
 
@@ -413,8 +426,13 @@ if $_NATIVE_MISSING; then
 fi
 
 print_subheader "Patched modules"
+# -F, so a marker is matched as the literal string it is: several of them contain
+# `[`, `]` and `"`, which grep would otherwise read as a pattern. The sandbox
+# marker is the proot separator rather than `prootProfileArgs`: the runner can be
+# installed while the separator hunk is missing, and that tree has no working
+# sandbox at all — checking the addition alone is what let it pass.
 _check_patched() { # file, grep-needle, label
-    if [ -f "$1" ] && grep -q "$2" "$1" 2>/dev/null; then print_ok "$3"
+    if [ -f "$1" ] && grep -qF -- "$2" "$1" 2>/dev/null; then print_ok "$3"
     else print_error "$3 ${DIM}(marker not found: $2)${RESET}"; _PATCH_MISSING=true; fi
 }
 _PATCH_MISSING=false
@@ -424,7 +442,7 @@ _check_patched "$(pkg_file dsh-attachment-local lib/index.js)"                  
 _check_patched "$(pkg_file node-addon-system lib/flock.js)"                         "IS_ANDROID" "flock: no-op on android"
 _check_patched "$(pkg_file dsh-subprocess-local lib/index.js)"                      "platform === \"android\"" "subprocess: android inspector"
 _check_patched "$(pkg_file dsh-terminal-bash lib/index.js)"                         "files/usr/bin/bash" "terminal: Termux shell"
-_check_patched "$(pkg_file dsh-sandbox-local lib/index.js)"                         "prootProfileArgs" "sandbox: proot runner"
+_check_patched "$(pkg_file dsh-sandbox-local lib/index.js)"                         'selected.runner === "proot" ? [] : ["--"]' "sandbox: proot runner + separator"
 _check_patched "$(pkg_file dsh-workspace lib/index.js)"                             "Termux: skip the sessionKnown" "workspace: archive fix"
 _check_patched "$(pkg_nm_root '@vscode/ripgrep')/@vscode/ripgrep-android-arm64/package.json" "ripgrep-android-arm64" "ripgrep shim"
 if $_PATCH_MISSING; then

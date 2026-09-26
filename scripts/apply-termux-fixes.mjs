@@ -98,6 +98,18 @@ function sub(src, from, to) {
   if (src.indexOf(from, i + 1) !== -1) throw new Error(`anchor not unique: ${from.slice(0, 70).replace(/\n/g, '\\n')}...`);
   return src.slice(0, i) + to + src.slice(i + from.length);
 }
+// subAny(src, [[from, to], ...], what): replace the first shape that is present.
+// Upstream sometimes moves a line between releases without changing what the
+// code does — `confine()` hoisted its runner argv into a local in 0.1.7-rc.2,
+// `archiveSession()` grew an argument. Listing every known shape keeps one fix
+// working across those releases; when none matches, the fix fails loudly instead
+// of guessing. Each shape still goes through sub(), so an ambiguous one throws.
+function subAny(src, pairs, what) {
+  for (const [from, to] of pairs) {
+    if (src.includes(from)) return sub(src, from, to);
+  }
+  throw new Error(`no known shape of ${what} in this core version`);
+}
 // fix(file, label, marker, transform): marker is the idempotency sentinel.
 function fix(file, label, marker, fn) {
   if (!existsSync(file)) { warn(`${label}: file missing (${file})`); stats.missing++; return; }
@@ -341,27 +353,116 @@ function fixSubprocess() {
 function fixTerminalShell() {
   step('7/13 terminal-bash: default shell that exists on Termux');
   fix(pkg('@deepseek-ai/dsh-terminal-bash', 'lib/index.js'), 'terminal-bash', 'files/usr/bin/bash', (src) => {
-    if (!/import \{ existsSync \} from "node:fs";/.test(src)) src = sub(src, 'import { createRequire } from "node:module";', 'import { existsSync } from "node:fs";\nimport { createRequire } from "node:module";');
-    src = sub(src, 'const DEFAULT_BASH_SHELL = "/bin/bash";', 'const DEFAULT_BASH_SHELL = process.platform === "android"\n\t? (existsSync("/data/data/com.termux/files/usr/bin/bash")\n\t\t? "/data/data/com.termux/files/usr/bin/bash"\n\t\t: (existsSync("/system/bin/sh") ? "/system/bin/sh" : "/bin/sh"))\n\t: "/bin/bash";');
-    return src;
+    // Prepend the import instead of anchoring on a neighbour line: 0.1.7-rc.2
+    // dropped the `node:module` import this used to sit in front of. Imports are
+    // hoisted, so the top of the file is the one position upstream cannot move.
+    if (!/import \{ existsSync \} from "node:fs";/.test(src)) {
+      src = 'import { existsSync } from "node:fs";\n' + src;
+    }
+    return sub(src, 'const DEFAULT_BASH_SHELL = "/bin/bash";', 'const DEFAULT_BASH_SHELL = process.platform === "android"\n\t? (existsSync("/data/data/com.termux/files/usr/bin/bash")\n\t\t? "/data/data/com.termux/files/usr/bin/bash"\n\t\t: (existsSync("/system/bin/sh") ? "/system/bin/sh" : "/bin/sh"))\n\t: "/bin/bash";');
   });
 }
 
 // ── 8. sandbox proot ───────────────────────────────────────────────────────
+// proot takes the command directly and rejects the `--` separator that bwrap
+// needs, and `confine()` has assembled that argv in two shapes across releases.
+// The runner itself still ships as patches/07 (sixty additive lines read better
+// as a patch). That patch also still carries the separator hunk, which no longer
+// anchors on 0.1.7-rc.2 — so running it exits non-zero on a tree that ends up
+// correct. The verdict is therefore the markers, not the exit code: every
+// addition the patch makes must be present afterwards, and the separator is
+// placed below by anchor for whichever shape the core has. Half-applied is the
+// one outcome that is worse than unpatched — the proot runner is registered,
+// every frozen argv still carries `--`, and proot dies with "unknown option
+// '--'" before the command starts, which takes bash and every file write down
+// with it.
+const PROOT_SEPARATOR = 'const separator = selected.runner === "proot" ? [] : ["--"];';
+const CONFINER_SHAPES = [
+  [`\t\tconst selected = this.selectRunner(policy.mode);
+\t\treturn {
+\t\t\targv: [
+\t\t\t\t...this.runnerArgv(selected.runner, policy),
+\t\t\t\t"--",`,
+   `\t\tconst selected = this.selectRunner(policy.mode);
+\t\t${PROOT_SEPARATOR}
+\t\treturn {
+\t\t\targv: [
+\t\t\t\t...this.runnerArgv(selected.runner, policy),
+\t\t\t\t...separator,`],
+  [`\t\tconst selected = this.selectRunner(policy.mode);
+\t\tconst runnerArgv = this.runnerArgv(selected.runner, policy);
+\t\treturn Promise.resolve({
+\t\t\targv: [
+\t\t\t\t...runnerArgv,
+\t\t\t\t"--",`,
+   `\t\tconst selected = this.selectRunner(policy.mode);
+\t\tconst runnerArgv = this.runnerArgv(selected.runner, policy);
+\t\t${PROOT_SEPARATOR}
+\t\treturn Promise.resolve({
+\t\t\targv: [
+\t\t\t\t...runnerArgv,
+\t\t\t\t...separator,`],
+];
+const PROOT_MARKERS = [
+  'function prootProfileArgs(policy)',
+  'function defaultProbeProot(timeoutMs)',
+  'android: ["proot", "bwrap", "landlock"]',
+  'proot: "partial"',
+  'proot: ["read-only file system", "permission denied"]',
+  'proot: [{ fatalSignatures: ["proot: ", "proot warning: "]',
+  'case "proot": return ["proot", ...prootProfileArgs(policy)];',
+  'case "proot": return (this.internals.probeProot',
+];
 function fixSandboxProot() {
   step('8/13 sandbox-local: proot runner for android');
-  const file = pkg('@deepseek-ai/dsh-sandbox-local', 'lib/index.js');
+  const pkgDir = pkg('@deepseek-ai/dsh-sandbox-local', '');
+  const file = join(pkgDir, 'lib', 'index.js');
   if (!existsSync(file)) { warn('sandbox-local: file missing'); stats.missing++; return; }
-  if (readFileSync(file, 'utf8').includes('prootProfileArgs')) { skip('sandbox-local: already applied'); stats.skipped++; return; }
   const patchFile = join(REPO, 'patches/07-sandbox-local-proot-runner.patch');
   if (!existsSync(patchFile)) { err('sandbox-local: patch file missing'); stats.failed++; return; }
-  try {
+  // A .rej left behind by an earlier, partly-applied run is exactly the trap
+  // this step used to fall into: the file contains `prootProfileArgs`, the whole
+  // step read as "already applied", and the tree stayed broken forever. Clear
+  // the evidence so a re-run can converge, and say so.
+  const rej = `${file}.rej`;
+  if (existsSync(rej)) { rmSync(rej, { force: true }); skip(`sandbox-local: removed the stale ${file.split('/').pop()}.rej`); }
+  const src = readFileSync(file, 'utf8');
+  if (PROOT_MARKERS.every((m) => src.includes(m))) skip('sandbox-local: proot runner already present');
+  else if (PROOT_MARKERS.some((m) => src.includes(m))) {
+    err('sandbox-local: the proot runner is only PARTLY applied — restore the pristine file '
+      + `(cp ${file}.orig-termux ${file}) and re-run, or reinstall the core`);
+    stats.failed++;
+    return;
+  } else {
     backup(file);
-    execFileSync('patch', ['-p1', '--forward', '-i', patchFile], { cwd: pkg('@deepseek-ai/dsh-sandbox-local', ''), stdio: 'inherit' });
+    let exit = 0;
+    try { execFileSync('patch', ['-p1', '--forward', '-i', patchFile], { cwd: pkgDir, stdio: 'inherit' }); }
+    catch { exit = 1; }
+    const missing = PROOT_MARKERS.filter((m) => !readFileSync(file, 'utf8').includes(m));
+    if (missing.length > 0) {
+      err(`sandbox-local: the proot patch left ${missing.length} addition(s) unplaced `
+        + `(${missing.join(', ')}) — see ${file.split('/').pop()}.rej`);
+      stats.failed++;
+      return;
+    }
     touched.add(file);
-    ok('sandbox-local: proot patch applied');
+    ok(exit === 0
+      ? 'sandbox-local: proot runner added'
+      : 'sandbox-local: proot runner added (one superseded hunk is placed by anchor below)');
     stats.changed++;
-  } catch (e) { err(`sandbox-local: patch failed (${e.message})`); stats.failed++; }
+  }
+  // The separator: anchor-based, both shapes, and it is the marker the whole
+  // step is verified by — a registered runner with a `--` in front of it is a
+  // dead sandbox, not a working one.
+  fix(file, 'sandbox-local proot separator', PROOT_SEPARATOR,
+    (text) => subAny(text, CONFINER_SHAPES, 'the confine() runner argv'));
+  // Only a fully placed separator makes the leftover .rej meaningless — and a
+  // .rej sitting next to a repaired file is what made the half-patched state
+  // look settled in the first place.
+  if (readFileSync(file, 'utf8').includes(PROOT_SEPARATOR) && existsSync(rej)) {
+    rmSync(rej, { force: true });
+    skip(`sandbox-local: removed ${file.split('/').pop()}.rej — every piece is in place`);
+  }
 }
 
 // ── 9. native-command ──────────────────────────────────────────────────────
@@ -384,11 +485,20 @@ function fixDirectoryPicker() {
 }
 
 // ── 11. workspace archive ──────────────────────────────────────────────────
+const WORKSPACE_ARCHIVE_NOTE = '// Termux: skip the sessionKnown() existence check. Sessions visible in the\n\t\t\t// UI may be absent from persistence (empty session dirs after an unclean\n\t\t\t// shutdown, or live sessions that were never persisted). Archiving is\n\t\t\t// just appending an id to a list and must not require storage presence.';
+// 0.1.7-rc.2 gave the error a reason argument ("archive" / "pin"), so the
+// argument-free anchor stopped matching. Both shapes are listed, and the
+// argument in the anchor is what keeps the unrelated `pin` call site out of it.
+const WORKSPACE_ARCHIVE_SHAPES = [
+  ['if (!await this.sessionKnown(sessionId)) throw new WorkspaceUnknownSessionError(sessionId);',
+   WORKSPACE_ARCHIVE_NOTE],
+  ['if (!await this.sessionKnown(sessionId)) throw new WorkspaceUnknownSessionError(sessionId, "archive");',
+   WORKSPACE_ARCHIVE_NOTE],
+];
 function fixWorkspaceArchive() {
   step('11/13 workspace: archiveSession tolerates unpersisted sessions');
-  fix(pkg('@deepseek-ai/dsh-workspace', 'lib/index.js'), 'workspace', 'Termux: skip the sessionKnown()', (src) => sub(src,
-    'if (!await this.sessionKnown(sessionId)) throw new WorkspaceUnknownSessionError(sessionId);',
-    '// Termux: skip the sessionKnown() existence check. Sessions visible in the\n\t\t\t// UI may be absent from persistence (empty session dirs after an unclean\n\t\t\t// shutdown, or live sessions that were never persisted). Archiving is\n\t\t\t// just appending an id to a list and must not require storage presence.'));
+  fix(pkg('@deepseek-ai/dsh-workspace', 'lib/index.js'), 'workspace', 'Termux: skip the sessionKnown()',
+    (src) => subAny(src, WORKSPACE_ARCHIVE_SHAPES, 'the archiveSession() sessionKnown() guard'));
 }
 
 // ── 12. ripgrep shim ───────────────────────────────────────────────────────
@@ -435,6 +545,52 @@ function fixBinShebang() {
   stats.changed++;
 }
 
+// ── verify: every fix present ──────────────────────────────────────────────
+// The patcher's exit code is what install.sh, fix-dsh-runtime.sh and
+// dsh-upgrade-tools read, so it must never report success for a tree that is
+// only partly patched — a half-applied fix is how a broken sandbox survived an
+// upgrade unnoticed. Every fix's own marker is re-read from disk here,
+// independently of the code that wrote it, and a miss lands in stats.failed.
+function verifyApplied() {
+  step('verify: every fix present in the installed tree');
+  const rules = [
+    ['2 fs-local link->rename', pkg('@deepseek-ai/dsh-fs-local', 'lib/index.js'), 'Termux/Android: sepolicy denies link(2) (EACCES/EPERM)'],
+    ['3 session-persistence link->rename', pkg('@deepseek-ai/dsh-session-persistence-jsonl', 'lib/index.js'), 'Android sepolicy blocks link(2)'],
+    ['3b session worker link->rename', pkg('@deepseek-ai/dsh-session-persistence-jsonl', 'lib/worker.cjs'), 'Android sepolicy blocks link(2)'],
+    ['4 attachment-local link->rename', pkg('@deepseek-ai/dsh-attachment-local', 'lib/index.js'), 'Termux/Android: sepolicy denies link(2)'],
+    ['5 flock no-op on android', pkg('@deepseek-ai/node-addon-system', 'lib/flock.js'), 'const IS_ANDROID'],
+    ['7 terminal-bash Termux shell', pkg('@deepseek-ai/dsh-terminal-bash', 'lib/index.js'), 'files/usr/bin/bash'],
+    ['8 sandbox-local proot runner', pkg('@deepseek-ai/dsh-sandbox-local', 'lib/index.js'), 'function prootProfileArgs'],
+    ['8b sandbox-local proot separator', pkg('@deepseek-ai/dsh-sandbox-local', 'lib/index.js'), PROOT_SEPARATOR],
+    ['9 native-command termux-open', pkg('@deepseek-ai/dsh-native-command', 'lib/index.js'), 'termux-open'],
+    ['10 directory-picker android', pkg('@deepseek-ai/dsh-host-directory-picker-native', 'lib/index.js'), 'platform === "linux" || platform === "android"'],
+    ['11 workspace archiveSession', pkg('@deepseek-ai/dsh-workspace', 'lib/index.js'), 'Termux: skip the sessionKnown()'],
+    ['13 bin.js --expose-internals', join(DSH, 'lib', 'bin.js'), '--expose-internals'],
+  ];
+  for (const [label, file, marker] of rules) {
+    if (existsSync(file) && readFileSync(file, 'utf8').includes(marker)) { skip(`${label}: present`); continue; }
+    err(`${label}: MISSING "${marker}" in ${file}`);
+    stats.failed++;
+  }
+  // 6 lives in a content-hashed bundle; 1 and 12 install things instead of
+  // editing them, so each needs its own shape of check.
+  const subLib = pkg('@deepseek-ai/dsh-subprocess-local', 'lib');
+  const runner = existsSync(subLib)
+    ? readdirSync(subLib).find((f) => f.startsWith('runner-launch-') && f.endsWith('.js')
+        && readFileSync(join(subLib, f), 'utf8').includes('platform === "linux" || platform === "android"'))
+    : undefined;
+  if (runner) skip(`6 subprocess-local android inspector: present (${runner})`);
+  else { err('6 subprocess-local android inspector: MISSING'); stats.failed++; }
+  const wasm = join(nmRootOf('sharp', pkg('sharp')), '@img/sharp-wasm32', 'index.cjs');
+  if (existsSync(wasm)) skip('1 sharp wasm fallback: present');
+  else { err('1 sharp @img/sharp-wasm32 fallback: MISSING'); stats.failed++; }
+  const rgShim = join(nmRootOf('@vscode/ripgrep', pkg('@vscode/ripgrep')), '@vscode/ripgrep-android-arm64', 'bin', 'rg');
+  let rgOk = false;
+  try { rgOk = existsSync(rgShim) && readlinkSync(rgShim) === RG_SYSTEM; } catch { rgOk = false; }
+  if (rgOk) skip('12 ripgrep shim: present');
+  else { err(`12 ripgrep shim: MISSING (${rgShim} -> ${RG_SYSTEM})`); stats.failed++; }
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 console.log(`${C.c}Termux fixes for @deepseek-ai/dsh${C.z}\n  dsh root: ${DSH}`);
 if (!existsSync(DSH)) { err(`dsh not found at ${DSH}`); process.exit(1); }
@@ -451,6 +607,7 @@ fixDirectoryPicker();
 fixWorkspaceArchive();
 fixRipgrepShim();
 fixBinShebang();
+verifyApplied();
 
 // Syntax-check every edited JavaScript file so a bad anchor can never ship.
 step('verify: node --check on every edited JS file');
